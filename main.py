@@ -48,6 +48,7 @@ STRESS_TEST_CONFIG = {
     'continuous_iterations': None,  # Number of question cycles to run (None = infinite until stopped)
     'continuous_cycle_delay': 5,  # Seconds to wait between question cycles (after all questions in cycle are asked)
     'maintain_concurrent': True,  # Maintain all conversations concurrently (don't wait for one to finish)
+    'concurrent_questions': True,  # Ask all questions concurrently (rapid-fire mode) for maximum stress
     # CSV Export Configuration
     'incremental_csv_export': True,  # Write CSV logs periodically during execution (not just at end)
     'csv_export_interval': 300,  # Seconds between incremental CSV exports (default: 5 minutes)
@@ -615,6 +616,220 @@ def setup_iframe_error_logging(iframe, tab_name, session_id=None, username=None)
     except Exception as e:
         logging.warning(f"{log_prefix} Failed to setup iframe error logging: {e}")
 
+async def ask_single_question(page, iframe, tab_name, question, question_num, session_id=None, course_number=None, username=None, question_metrics=None):
+    """Ask a single question to the chatbot concurrently.
+    
+    Returns a metric dictionary for the question.
+    """
+    question_start = time.time()
+    try:
+        logging.info(f"[{tab_name}] ========== Question {question_num} (Concurrent) ==========")
+        
+        # Re-acquire iframe for each question in case it changed
+        try:
+            iframe = await get_iframe_content_frame(page, tab_name)
+            # Re-setup iframe error logging in case iframe reloaded
+            setup_iframe_error_logging(iframe, tab_name, session_id=session_id, username=username)
+        except Exception as e:
+            logging.warning(f"[{tab_name}] Could not get iframe for question {question_num}, refreshing and retrying...")
+            try:
+                # Refresh page and retry
+                await page.reload(wait_until='domcontentloaded', timeout=30000)
+                await asyncio.sleep(2)
+                iframe = await get_iframe_content_frame(page, tab_name)
+                logging.info(f"[{tab_name}] Successfully got iframe after refresh")
+            except Exception as retry_error:
+                logging.error(f"[{tab_name}] Failed to get iframe even after refresh: {retry_error}")
+                return {
+                    'question_number': question_num,
+                    'question': question,
+                    'question_submit_time': 0,
+                    'response_wait_time': 0,
+                    'question_total_time': 0,
+                    'response_received': False,
+                    'error': f'Could not get iframe after refresh: {str(retry_error)}'
+                }
+        
+        # Wait for question box to be ready with robust retry logic and refresh on error
+        question_box = None
+        for attempt in range(10):  # More attempts for better reliability
+            try:
+                # Re-acquire iframe first (it might have reloaded)
+                iframe = await get_iframe_content_frame(page, tab_name)
+                # Re-setup iframe error logging in case iframe reloaded
+                setup_iframe_error_logging(iframe, tab_name, session_id=session_id, username=username)
+                
+                # Try to find question box with multiple strategies
+                question_box = iframe.get_by_role('textbox', name='Enter your question here')
+                
+                # Wait for it to be visible and enabled
+                await question_box.wait_for(state='visible', timeout=15000)
+                
+                # Verify it's actually usable
+                is_visible = await question_box.is_visible()
+                is_enabled = await question_box.is_enabled()
+                
+                if is_visible and is_enabled:
+                    logging.info(f"[{tab_name}] Question {question_num} - Question box found and ready on attempt {attempt + 1}")
+                    break
+                else:
+                    raise Exception(f"Question box not usable: visible={is_visible}, enabled={is_enabled}")
+                    
+            except Exception as e:
+                logging.debug(f"[{tab_name}] Attempt {attempt + 1} to find question box for question {question_num} failed: {e}")
+                if attempt < 9:
+                    # Progressive backoff: wait longer with each attempt
+                    wait_time = 0.5 + (attempt * 0.3)  # Shorter wait for concurrent mode
+                    await asyncio.sleep(wait_time)
+                else:
+                    logging.warning(f"[{tab_name}] Could not find question box for question {question_num} after {attempt + 1} attempts")
+                    question_box = None
+        
+        if question_box is None:
+            logging.warning(f"[{tab_name}] Skipping question {question_num} - question box not available")
+            return {
+                'question_number': question_num,
+                'question': question,
+                'question_submit_time': 0,
+                'response_wait_time': 0,
+                'question_total_time': (time.time() - question_start) * 1000,
+                'response_received': False,
+                'error': 'Question box not available'
+            }
+        
+        # Clear previous question if any
+        try:
+            await question_box.click()
+            await question_box.fill('')  # Clear field
+        except Exception as e:
+            logging.debug(f"[{tab_name}] Could not clear question box: {e}")
+        
+        # Time the question submission
+        question_submit_start = time.time()
+        await question_box.fill(question)
+        await question_box.press('Enter')  # Submit question
+        question_submit_time = (time.time() - question_submit_start) * 1000
+        logging.info(f"[{tab_name}] Question {question_num} - Question: {question}")
+        logging.info(f"[{tab_name}] Question {question_num} - Question submitted in {question_submit_time:.2f}ms (CONCURRENT MODE)")
+        
+        # Wait for bot response - monitor for response indicators
+        logging.info(f"[{tab_name}] Question {question_num} - Waiting for bot response...")
+        response_wait_start = time.time()
+        
+        # Dynamic wait for response - check periodically if response appeared
+        min_wait = QUESTION_CONFIG['min_response_wait']
+        max_wait = QUESTION_CONFIG['max_response_wait']
+        check_interval = QUESTION_CONFIG['response_check_interval']
+        waited_time = 0
+        response_received = False
+        
+        # Wait minimum time first
+        await asyncio.sleep(min_wait)
+        waited_time = min_wait
+        
+        # Then check periodically for response - verify after each question
+        while waited_time < max_wait:
+            try:
+                # Re-acquire iframe in case it reloaded
+                try:
+                    iframe = await get_iframe_content_frame(page, tab_name)
+                    # Re-setup iframe error logging in case iframe reloaded
+                    setup_iframe_error_logging(iframe, tab_name, session_id=session_id, username=username)
+                except:
+                    pass
+                
+                # Try to detect if response appeared by checking if question box is ready again
+                question_box_check = iframe.get_by_role('textbox', name='Enter your question here')
+                is_visible = await question_box_check.is_visible()
+                is_enabled = await question_box_check.is_enabled()
+                
+                # If question box is visible and enabled after minimum wait, response likely completed
+                if waited_time >= min_wait and is_visible and is_enabled:
+                    # Additional check: verify response is complete by checking if we can interact
+                    try:
+                        # Try to click/focus the question box to ensure UI is ready
+                        await question_box_check.click(timeout=2000)
+                        await asyncio.sleep(1)  # Small delay to ensure response is fully rendered
+                        response_received = True
+                        logging.info(f"[{tab_name}] Question {question_num} - Response detected and verified after {waited_time + 1}s")
+                        break
+                    except Exception as e:
+                        logging.debug(f"[{tab_name}] Question {question_num} - Response check interaction failed: {e}")
+                        # Continue waiting
+            except Exception as e:
+                logging.debug(f"[{tab_name}] Question {question_num} - Error checking response: {e}")
+            
+            await asyncio.sleep(check_interval)
+            waited_time += check_interval
+        
+        # If we've reached max wait time, assume response received
+        if not response_received and waited_time >= max_wait:
+            response_received = True
+            logging.info(f"[{tab_name}] Question {question_num} - Max wait time reached, assuming response received")
+        
+        response_wait_time = (time.time() - response_wait_start) * 1000
+        question_total_time = (time.time() - question_start) * 1000
+        
+        question_metric = {
+            'question_number': question_num,
+            'question': question,
+            'question_submit_time': question_submit_time,
+            'response_wait_time': response_wait_time,
+            'question_total_time': question_total_time,
+            'response_received': response_received
+        }
+        
+        # Store in CSV metrics if session_id and course_number provided
+        if session_id and course_number:
+            CSV_METRICS.append({
+                'session_id': session_id,
+                'course_number': course_number,
+                'question_number': question_num,
+                'question_text': question[:200] if len(question) > 200 else question,
+                'question_submit_time_ms': round(question_submit_time, 2),
+                'response_wait_time_ms': round(response_wait_time, 2),
+                'question_total_time_ms': round(question_total_time, 2),
+                'response_received': response_received,
+                'error': '',
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+            })
+        
+        logging.info(f"[{tab_name}] Question {question_num} - Response wait time: {response_wait_time:.2f}ms")
+        logging.info(f"[{tab_name}] Question {question_num} - Total question time: {question_total_time:.2f}ms")
+        logging.info(f"[{tab_name}] Question {question_num} - Response received: {response_received}")
+        
+        return question_metric
+        
+    except Exception as question_error:
+        logging.error(f"[{tab_name}] Error in question {question_num}: {question_error}")
+        question_total_time = (time.time() - question_start) * 1000
+        question_metric = {
+            'question_number': question_num,
+            'question': question,
+            'question_submit_time': 0,
+            'response_wait_time': 0,
+            'question_total_time': question_total_time,
+            'response_received': False,
+            'error': str(question_error)
+        }
+        
+        # Store error in CSV metrics
+        if session_id and course_number:
+            CSV_METRICS.append({
+                'session_id': session_id,
+                'course_number': course_number,
+                'question_number': question_num,
+                'question_text': question,
+                'question_submit_time_ms': 0,
+                'response_wait_time_ms': 0,
+                'question_total_time_ms': round(question_total_time, 2),
+                'response_received': False,
+                'error': str(question_error),
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+            })
+        
+        return question_metric
+
 async def interact_with_chatbot(page, tab_name, questions=None, session_id=None, course_number=None, username=None, continuous_mode=False, continuous_iterations=None):
     """Interact with chatbot on a given page.
     
@@ -700,6 +915,9 @@ async def interact_with_chatbot(page, tab_name, questions=None, session_id=None,
             questions_to_use = questions[:QUESTION_CONFIG['questions_per_session']]
         logging.info(f"[{tab_name}] Using {len(questions_to_use)} questions: {questions_to_use}")
         
+        # Check if concurrent questions mode is enabled
+        concurrent_questions = STRESS_TEST_CONFIG.get('concurrent_questions', False)
+        
         # Continuous mode: loop through questions multiple times
         cycle_count = 0
         cycle_delay = STRESS_TEST_CONFIG.get('continuous_cycle_delay', 5)
@@ -711,214 +929,58 @@ async def interact_with_chatbot(page, tab_name, questions=None, session_id=None,
             else:
                 logging.info(f"[{tab_name}] Will run infinite cycles until stopped")
         
+        if concurrent_questions:
+            logging.info(f"[{tab_name}] ⚡ CONCURRENT QUESTIONS MODE ENABLED - All questions will be asked simultaneously")
+        
         while True:
             cycle_count += 1
             if continuous_mode:
                 logging.info(f"[{tab_name}] ========== Starting Question Cycle {cycle_count} ==========")
             
-            # Interact with bot for multiple questions
-            for question_num, question in enumerate(questions_to_use, 1):
-                try:
-                    logging.info(f"[{tab_name}] ========== Question {question_num} ==========")
-                    question_start = time.time()
-                    
-                    # Re-acquire iframe for each question in case it changed
-                    try:
-                        iframe = await get_iframe_content_frame(page, tab_name)
-                        # Re-setup iframe error logging in case iframe reloaded
-                        setup_iframe_error_logging(iframe, tab_name, session_id=session_id, username=username)
-                    except Exception as e:
-                        logging.warning(f"[{tab_name}] Could not get iframe for question {question_num}, refreshing and retrying...")
-                        try:
-                            # Refresh page and retry
-                            await page.reload(wait_until='domcontentloaded', timeout=30000)
-                            await asyncio.sleep(2)
-                            iframe = await get_iframe_content_frame(page, tab_name)
-                            logging.info(f"[{tab_name}] Successfully got iframe after refresh")
-                        except Exception as retry_error:
-                            logging.error(f"[{tab_name}] Failed to get iframe even after refresh: {retry_error}")
-                            question_metrics.append({
-                                'question_number': question_num,
-                                'question': question,
-                                'question_submit_time': 0,
-                                'response_wait_time': 0,
-                                'question_total_time': 0,
-                                'response_received': False,
-                                'error': f'Could not get iframe after refresh: {str(retry_error)}'
-                            })
-                            continue
-                    
-                    # Wait for question box to be ready with robust retry logic and refresh on error
-                    question_box = None
-                    for attempt in range(10):  # More attempts for better reliability
-                        try:
-                            # Re-acquire iframe first (it might have reloaded)
-                            iframe = await get_iframe_content_frame(page, tab_name)
-                            # Re-setup iframe error logging in case iframe reloaded
-                            setup_iframe_error_logging(iframe, tab_name, session_id=session_id, username=username)
-                            
-                            # Try to find question box with multiple strategies
-                            question_box = iframe.get_by_role('textbox', name='Enter your question here')
-                            
-                            # Wait for it to be visible and enabled
-                            await question_box.wait_for(state='visible', timeout=15000)
-                            
-                            # Verify it's actually usable
-                            is_visible = await question_box.is_visible()
-                            is_enabled = await question_box.is_enabled()
-                            
-                            if is_visible and is_enabled:
-                                logging.info(f"[{tab_name}] Question box found and ready on attempt {attempt + 1}")
-                                break
-                            else:
-                                raise Exception(f"Question box not usable: visible={is_visible}, enabled={is_enabled}")
-                                
-                        except Exception as e:
-                            logging.debug(f"[{tab_name}] Attempt {attempt + 1} to find question box for question {question_num} failed: {e}")
-                            if attempt < 9:
-                                # Refresh page and retry iframe access on error
-                                if attempt >= 3:  # After 3 failed attempts, try refreshing
-                                    logging.info(f"[{tab_name}] Refreshing page due to iframe/question box error...")
-                                    try:
-                                        await page.reload(wait_until='domcontentloaded', timeout=30000)
-                                        await asyncio.sleep(2)  # Wait for page to stabilize
-                                        # Re-click chatbot button after refresh
-                                        try:
-                                            chatbot_btn = page.locator('._chatbot_btn_in_iframe')
-                                            await chatbot_btn.wait_for(state='visible', timeout=10000)
-                                            await chatbot_btn.click(timeout=5000)
-                                            await asyncio.sleep(2)  # Wait for chatbot to load
-                                        except:
-                                            pass  # Chatbot might already be open
-                                    except Exception as refresh_error:
-                                        logging.warning(f"[{tab_name}] Page refresh failed: {refresh_error}")
-                                
-                                # Progressive backoff: wait longer with each attempt
-                                wait_time = 1 + (attempt * 0.5)  # 1, 1.5, 2, 2.5, 3... seconds
-                                await asyncio.sleep(wait_time)
-                            else:
-                                logging.warning(f"[{tab_name}] Could not find question box for question {question_num} after {attempt + 1} attempts")
-                                question_box = None
-                    
-                    if question_box is None:
-                        logging.warning(f"[{tab_name}] Skipping question {question_num} - question box not available")
+            if concurrent_questions:
+                # CONCURRENT MODE: Ask all questions simultaneously
+                logging.info(f"[{tab_name}] 🚀 Launching {len(questions_to_use)} questions concurrently...")
+                question_tasks = []
+                for question_num, question in enumerate(questions_to_use, 1):
+                    question_tasks.append(
+                        ask_single_question(
+                            page, iframe, tab_name, question, question_num,
+                            session_id=session_id, course_number=course_number,
+                            username=username, question_metrics=question_metrics
+                        )
+                    )
+                
+                # Launch all questions concurrently
+                cycle_question_start = time.time()
+                results = await asyncio.gather(*question_tasks, return_exceptions=True)
+                cycle_question_time = (time.time() - cycle_question_start) * 1000
+                
+                # Process results
+                for result in results:
+                    if isinstance(result, Exception):
+                        logging.error(f"[{tab_name}] Question task failed with exception: {result}")
                         question_metrics.append({
-                            'question_number': question_num,
-                            'question': question,
+                            'question_number': len(question_metrics) + 1,
+                            'question': 'Unknown',
                             'question_submit_time': 0,
                             'response_wait_time': 0,
-                            'question_total_time': (time.time() - question_start) * 1000,
+                            'question_total_time': 0,
                             'response_received': False,
-                            'error': 'Question box not available'
+                            'error': str(result)
                         })
-                        continue
-                    
-                    # Clear previous question if any
-                    try:
-                        await question_box.click()
-                        await question_box.fill('')  # Clear field
-                    except Exception as e:
-                        logging.debug(f"[{tab_name}] Could not clear question box: {e}")
-                    
-                    # Time the question submission
-                    question_submit_start = time.time()
-                    await question_box.fill(question)
-                    await question_box.press('Enter')  # Submit question
-                    question_submit_time = (time.time() - question_submit_start) * 1000
-                    logging.info(f"[{tab_name}] Question {question_num} - Question: {question}")
-                    logging.info(f"[{tab_name}] Question {question_num} - Question submission time: {question_submit_time:.2f}ms")
-                    
-                    # Wait for bot response - monitor for response indicators
-                    logging.info(f"[{tab_name}] Question {question_num} - Waiting for bot response...")
-                    response_wait_start = time.time()
-                    
-                    # Dynamic wait for response - check periodically if response appeared
-                    min_wait = QUESTION_CONFIG['min_response_wait']
-                    max_wait = QUESTION_CONFIG['max_response_wait']
-                    check_interval = QUESTION_CONFIG['response_check_interval']
-                    waited_time = 0
-                    response_received = False
-                    
-                    # Wait minimum time first
-                    await asyncio.sleep(min_wait)
-                    waited_time = min_wait
-                    
-                    # Then check periodically for response - verify after each question
-                    while waited_time < max_wait:
-                        try:
-                            # Re-acquire iframe in case it reloaded
-                            try:
-                                iframe = await get_iframe_content_frame(page, tab_name)
-                                # Re-setup iframe error logging in case iframe reloaded
-                                setup_iframe_error_logging(iframe, tab_name, session_id=session_id, username=username)
-                            except:
-                                pass
-                            
-                            # Try to detect if response appeared by checking if question box is ready again
-                            question_box_check = iframe.get_by_role('textbox', name='Enter your question here')
-                            is_visible = await question_box_check.is_visible()
-                            is_enabled = await question_box_check.is_enabled()
-                            
-                            # If question box is visible and enabled after minimum wait, response likely completed
-                            if waited_time >= min_wait and is_visible and is_enabled:
-                                # Additional check: verify response is complete by checking if we can interact
-                                try:
-                                    # Try to click/focus the question box to ensure UI is ready
-                                    await question_box_check.click(timeout=2000)
-                                    await asyncio.sleep(1)  # Small delay to ensure response is fully rendered
-                                    response_received = True
-                                    logging.info(f"[{tab_name}] Question {question_num} - Response detected and verified after {waited_time + 1}s")
-                                    break
-                                except Exception as e:
-                                    logging.debug(f"[{tab_name}] Question {question_num} - Response check interaction failed: {e}")
-                                    # Continue waiting
-                        except Exception as e:
-                            logging.debug(f"[{tab_name}] Question {question_num} - Error checking response: {e}")
-                        
-                        await asyncio.sleep(check_interval)
-                        waited_time += check_interval
-                    
-                    # If we've reached max wait time, assume response received
-                    if not response_received and waited_time >= max_wait:
-                        response_received = True
-                        logging.info(f"[{tab_name}] Question {question_num} - Max wait time reached, assuming response received")
-                    
-                    # Wait additional time after response to ensure UI is ready for next question
-                    if response_received:
-                        logging.info(f"[{tab_name}] Question {question_num} - Waiting for UI to stabilize after response...")
-                        await asyncio.sleep(2)  # Give UI time to stabilize
-                    
-                    response_wait_time = (time.time() - response_wait_start) * 1000
-                    question_total_time = (time.time() - question_start) * 1000
-                    
-                    question_metric = {
-                        'question_number': question_num,
-                        'question': question,
-                        'question_submit_time': question_submit_time,
-                        'response_wait_time': response_wait_time,
-                        'question_total_time': question_total_time,
-                        'response_received': response_received
-                    }
-                    question_metrics.append(question_metric)
-                    
-                    # Store in CSV metrics if session_id and course_number provided
-                    if session_id and course_number:
-                        CSV_METRICS.append({
-                            'session_id': session_id,
-                            'course_number': course_number,
-                            'question_number': question_num,
-                            'question_text': question[:200] if len(question) > 200 else question,  # Limit length
-                            'question_submit_time_ms': round(question_submit_time, 2),
-                            'response_wait_time_ms': round(response_wait_time, 2),
-                            'question_total_time_ms': round(question_total_time, 2),
-                            'response_received': response_received,
-                            'error': '',
-                            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
-                        })
-                    
-                    logging.info(f"[{tab_name}] Question {question_num} - Response wait time: {response_wait_time:.2f}ms")
-                    logging.info(f"[{tab_name}] Question {question_num} - Total question time: {question_total_time:.2f}ms")
-                    logging.info(f"[{tab_name}] Question {question_num} - Response received: {response_received}")
+                    elif isinstance(result, dict):
+                        question_metrics.append(result)
+                
+                logging.info(f"[{tab_name}] ✅ All {len(questions_to_use)} questions completed concurrently in {cycle_question_time:.2f}ms")
+            else:
+                # SEQUENTIAL MODE: Ask questions one by one (original behavior)
+                for question_num, question in enumerate(questions_to_use, 1):
+                    metric = await ask_single_question(
+                        page, iframe, tab_name, question, question_num,
+                        session_id=session_id, course_number=course_number,
+                        username=username, question_metrics=question_metrics
+                    )
+                    question_metrics.append(metric)
                     
                     # Delay between questions - configurable for WebSocket stress testing
                     if question_num < len(questions_to_use):
@@ -932,41 +994,8 @@ async def interact_with_chatbot(page, tab_name, questions=None, session_id=None,
                             delay = STRESS_TEST_CONFIG.get('delay_between_questions', 3)
                             logging.info(f"[{tab_name}] Waiting {delay}s before next question...")
                         await asyncio.sleep(delay)
-                        
-                except Exception as question_error:
-                    logging.error(f"[{tab_name}] Error in question {question_num}: {question_error}")
-                    question_total_time = (time.time() - question_start) * 1000 if 'question_start' in locals() else 0
-                    question_metric = {
-                        'question_number': question_num,
-                        'question': question,
-                        'question_submit_time': 0,
-                        'response_wait_time': 0,
-                        'question_total_time': question_total_time,
-                        'response_received': False,
-                        'error': str(question_error)
-                    }
-                    question_metrics.append(question_metric)
-                    
-                    # Store error in CSV metrics
-                    if session_id and course_number:
-                        CSV_METRICS.append({
-                            'session_id': session_id,
-                            'course_number': course_number,
-                            'question_number': question_num,
-                            'question_text': question,
-                            'question_submit_time_ms': 0,
-                            'response_wait_time_ms': 0,
-                            'question_total_time_ms': round(question_total_time, 2),
-                            'response_received': False,
-                            'error': str(question_error),
-                            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
-                        })
-                    # Wait before trying next question
-                    if question_num < len(questions_to_use):
-                        await asyncio.sleep(2)
-                    continue
             
-            # After completing all questions in cycle
+            # After completing all questions in cycle (both concurrent and sequential modes)
             if continuous_mode:
                 # Check if we should continue
                 if continuous_iterations and cycle_count >= continuous_iterations:
@@ -1474,8 +1503,12 @@ async def run_session_with_context(browser, user, session_id, questions=None, qu
         handle_both_courses=handle_both_courses
     )
     
+    # Acquire semaphore only for creating browser context (limit concurrent context creation)
     if semaphore:
         await semaphore.acquire()
+        semaphore_acquired = True
+    else:
+        semaphore_acquired = False
     
     # Handle backward compatibility: if question is provided but questions is not, use question
     if questions is None and question is not None:
@@ -1495,6 +1528,8 @@ async def run_session_with_context(browser, user, session_id, questions=None, qu
                     stage='browser_check'
                 )
                 logging.error(f"Session {session_id}: {error_msg}")
+                if semaphore_acquired:
+                    semaphore.release()
                 return {'session_id': session_id, 'success': False, 'error': error_msg}
         except Exception as e:
             import traceback
@@ -1509,12 +1544,21 @@ async def run_session_with_context(browser, user, session_id, questions=None, qu
                 stage='browser_check'
             )
             logging.error(f"Session {session_id}: {error_msg}")
+            if semaphore_acquired:
+                semaphore.release()
             return {'session_id': session_id, 'success': False, 'error': error_msg}
         
         # Create a new browser context for this session (separate window)
         try:
             context = await browser.new_context()
             logging.info(f"Session {session_id}: Created new browser context")
+            
+            # Release semaphore immediately after context creation to allow other sessions to proceed
+            # The context is already created, so we don't need to hold the semaphore anymore
+            if semaphore_acquired:
+                semaphore.release()
+                semaphore_acquired = False
+                logging.debug(f"Session {session_id}: Released semaphore after context creation")
             log_session_event(
                 session_id, 
                 'INFO', 
@@ -1535,6 +1579,8 @@ async def run_session_with_context(browser, user, session_id, questions=None, qu
                 stage='context_creation'
             )
             logging.error(f"Session {session_id}: {error_msg}")
+            if semaphore_acquired:
+                semaphore.release()
             return {'session_id': session_id, 'success': False, 'error': error_msg}
         
         # Verify context was created successfully
@@ -1549,6 +1595,8 @@ async def run_session_with_context(browser, user, session_id, questions=None, qu
                 stage='context_verification'
             )
             logging.error(f"Session {session_id}: {error_msg}")
+            if semaphore_acquired:
+                semaphore.release()
             return {'session_id': session_id, 'success': False, 'error': error_msg}
         
         # Small delay to ensure context is ready
@@ -1707,9 +1755,10 @@ async def run_session_with_context(browser, user, session_id, questions=None, qu
                     username=username,
                     stage='cleanup_error'
                 )
-        if semaphore:
+        # Semaphore was already released after context creation, but release again if somehow still held
+        if semaphore_acquired and semaphore:
             semaphore.release()
-            logging.debug(f"Session {session_id}: Released semaphore")
+            logging.debug(f"Session {session_id}: Released semaphore in finally block")
 
 def write_session_logs_csv(append_mode=False):
     """Write session-level logs and errors to CSV file in parallel with other reports.
