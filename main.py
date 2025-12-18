@@ -23,6 +23,12 @@ PAGE_ERRORS = []
 # Global list to store session-level logs and errors for CSV
 SESSION_LOGS = []
 
+# Track last CSV export time for incremental exports
+LAST_CSV_EXPORT_TIME = None
+CSV_EXPORT_FILENAME = None
+SESSION_CSV_EXPORT_FILENAME = None
+ERRORS_CSV_EXPORT_FILENAME = None
+
 # ============================================================================
 # STRESS TEST CONFIGURATION
 # ============================================================================
@@ -42,6 +48,9 @@ STRESS_TEST_CONFIG = {
     'continuous_iterations': None,  # Number of question cycles to run (None = infinite until stopped)
     'continuous_cycle_delay': 5,  # Seconds to wait between question cycles (after all questions in cycle are asked)
     'maintain_concurrent': True,  # Maintain all conversations concurrently (don't wait for one to finish)
+    # CSV Export Configuration
+    'incremental_csv_export': True,  # Write CSV logs periodically during execution (not just at end)
+    'csv_export_interval': 300,  # Seconds between incremental CSV exports (default: 5 minutes)
     # Example: 5 users × 1 session = 5 concurrent browser windows, each handling one course
 }
 
@@ -1690,15 +1699,25 @@ async def run_session_with_context(browser, user, session_id, questions=None, qu
             semaphore.release()
             logging.debug(f"Session {session_id}: Released semaphore")
 
-def write_session_logs_csv():
-    """Write session-level logs and errors to CSV file in parallel with other reports."""
+def write_session_logs_csv(append_mode=False):
+    """Write session-level logs and errors to CSV file in parallel with other reports.
+    
+    Args:
+        append_mode: If True, append to existing file. If False, create new file.
+    """
+    global SESSION_CSV_EXPORT_FILENAME
+    
     if not SESSION_LOGS:
-        logging.warning("No session logs collected to write to CSV")
+        if not append_mode:
+            logging.warning("No session logs collected to write to CSV")
         return
     
-    # Generate filename with timestamp
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    session_csv_filename = f"session_logs_{timestamp}.csv"
+    # Generate filename with timestamp (only on first write)
+    if SESSION_CSV_EXPORT_FILENAME is None or not append_mode:
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        SESSION_CSV_EXPORT_FILENAME = f"session_logs_{timestamp}.csv"
+    
+    session_csv_filename = SESSION_CSV_EXPORT_FILENAME
     
     # Define CSV columns for session logs
     fieldnames = [
@@ -1719,11 +1738,36 @@ def write_session_logs_csv():
     ]
     
     try:
-        with open(session_csv_filename, 'w', newline='', encoding='utf-8') as csvfile:
+        # Determine which entries to write
+        # Track written entries to avoid duplicates in append mode
+        if not hasattr(write_session_logs_csv, '_written_indices'):
+            write_session_logs_csv._written_indices = set()
+        
+        if append_mode:
+            # In append mode, only write new entries
+            entries_to_write = [log_entry for i, log_entry in enumerate(SESSION_LOGS) 
+                               if i not in write_session_logs_csv._written_indices]
+            if not entries_to_write:
+                return  # No new entries to write
+            mode = 'a'
+        else:
+            # In write mode, write all entries
+            entries_to_write = SESSION_LOGS
+            mode = 'w'
+            write_session_logs_csv._written_indices = set()
+        
+        with open(session_csv_filename, mode, newline='', encoding='utf-8') as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames, extrasaction='ignore')
-            writer.writeheader()
             
-            for log_entry in SESSION_LOGS:
+            # Write header only if creating new file
+            if not append_mode:
+                writer.writeheader()
+            
+            # Write entries and track indices
+            start_index = len(write_session_logs_csv._written_indices)
+            for i, log_entry in enumerate(entries_to_write):
+                entry_index = start_index + i
+                write_session_logs_csv._written_indices.add(entry_index)
                 # Prepare row with all fields, handling missing ones
                 row = {
                     'session_id': log_entry.get('session_id', ''),
@@ -1742,37 +1786,53 @@ def write_session_logs_csv():
                 }
                 writer.writerow(row)
         
-        logging.info(f"✓ Session logs CSV report written to: {session_csv_filename}")
-        logging.info(f"  Total session log records: {len(SESSION_LOGS)}")
+        if append_mode:
+            logging.info(f"✓ Session logs CSV report updated (appended): {session_csv_filename}")
+            logging.info(f"  Added {len(entries_to_write)} new log records (total: {len(SESSION_LOGS)})")
+        else:
+            logging.info(f"✓ Session logs CSV report written to: {session_csv_filename}")
+            logging.info(f"  Total session log records: {len(SESSION_LOGS)}")
         
-        # Count by event type
-        event_counts = {}
-        error_count = 0
-        for log_entry in SESSION_LOGS:
-            event_type = log_entry.get('event_type', 'UNKNOWN')
-            event_counts[event_type] = event_counts.get(event_type, 0) + 1
-            if event_type == 'ERROR':
-                error_count += 1
-        
-        logging.info(f"  Event type breakdown:")
-        for event_type, count in event_counts.items():
-            logging.info(f"    {event_type}: {count}")
-        logging.info(f"  Total errors: {error_count}")
+        # Count by event type (only for full export)
+        if not append_mode:
+            event_counts = {}
+            error_count = 0
+            for log_entry in SESSION_LOGS:
+                event_type = log_entry.get('event_type', 'UNKNOWN')
+                event_counts[event_type] = event_counts.get(event_type, 0) + 1
+                if event_type == 'ERROR':
+                    error_count += 1
+            
+            logging.info(f"  Event type breakdown:")
+            for event_type, count in event_counts.items():
+                logging.info(f"    {event_type}: {count}")
+            logging.info(f"  Total errors: {error_count}")
         
     except Exception as e:
         logging.error(f"✗ Error writing session logs CSV report: {e}")
         import traceback
         logging.error(traceback.format_exc())
 
-def write_csv_report():
-    """Write collected metrics to CSV file."""
-    if not CSV_METRICS:
-        logging.warning("No metrics collected to write to CSV")
+def write_csv_report(append_mode=False):
+    """Write collected metrics to CSV file.
+    
+    Args:
+        append_mode: If True, append to existing file. If False, create new file.
+    """
+    global CSV_EXPORT_FILENAME, ERRORS_CSV_EXPORT_FILENAME
+    
+    if not CSV_METRICS and not PAGE_ERRORS:
+        if not append_mode:
+            logging.warning("No metrics collected to write to CSV")
         return
     
-    # Generate filename with timestamp
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    csv_filename = f"stress_test_results_{timestamp}.csv"
+    # Generate filename with timestamp (only on first write)
+    if CSV_EXPORT_FILENAME is None or not append_mode:
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        CSV_EXPORT_FILENAME = f"stress_test_results_{timestamp}.csv"
+        ERRORS_CSV_EXPORT_FILENAME = f"stress_test_errors_{timestamp}.csv"
+    
+    csv_filename = CSV_EXPORT_FILENAME
     
     # Define CSV columns
     fieldnames = [
@@ -1792,12 +1852,37 @@ def write_csv_report():
     ]
     
     try:
-        with open(csv_filename, 'w', newline='', encoding='utf-8') as csvfile:
+        # Determine which entries to write
+        if not hasattr(write_csv_report, '_written_indices'):
+            write_csv_report._written_indices = set()
+        
+        if append_mode:
+            # In append mode, only write new entries
+            metrics_to_write = [metric for i, metric in enumerate(CSV_METRICS) 
+                               if i not in write_csv_report._written_indices]
+            if not metrics_to_write:
+                metrics_to_write = []  # No new metrics
+            mode = 'a'
+        else:
+            # In write mode, write all entries
+            metrics_to_write = CSV_METRICS
+            mode = 'w'
+            write_csv_report._written_indices = set()
+        
+        with open(csv_filename, mode, newline='', encoding='utf-8') as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            writer.writeheader()
             
-            # Extract user from session_id for better readability
-            for metric in CSV_METRICS:
+            # Write header only if creating new file
+            if not append_mode:
+                writer.writeheader()
+            
+            # Write entries and track indices
+            start_index = len(write_csv_report._written_indices)
+            for i, metric in enumerate(metrics_to_write):
+                entry_index = start_index + i
+                write_csv_report._written_indices.add(entry_index)
+                
+                # Extract user from session_id for better readability
                 # Extract user from session_id (format: User1_Session1_username@domain.com)
                 session_id = metric.get('session_id', '')
                 user = 'Unknown'
@@ -1824,12 +1909,16 @@ def write_csv_report():
                 }
                 writer.writerow(row)
         
-        logging.info(f"✓ CSV report written to: {csv_filename}")
-        logging.info(f"  Total records: {len(CSV_METRICS)}")
+        if append_mode:
+            logging.info(f"✓ CSV report updated (appended): {csv_filename}")
+            logging.info(f"  Added {len(metrics_to_write)} new records (total: {len(CSV_METRICS)})")
+        else:
+            logging.info(f"✓ CSV report written to: {csv_filename}")
+            logging.info(f"  Total records: {len(CSV_METRICS)}")
         
         # Write errors CSV if there are any errors
         if PAGE_ERRORS:
-            errors_csv_filename = f"stress_test_errors_{timestamp}.csv"
+            errors_csv_filename = ERRORS_CSV_EXPORT_FILENAME
             error_fieldnames = [
                 'type',
                 'message',
@@ -1845,11 +1934,33 @@ def write_csv_report():
             ]
             
             try:
-                with open(errors_csv_filename, 'w', newline='', encoding='utf-8') as errors_csvfile:
+                # Determine which errors to write
+                if not hasattr(write_csv_report, '_error_written_indices'):
+                    write_csv_report._error_written_indices = set()
+                
+                if append_mode:
+                    errors_to_write = [error for i, error in enumerate(PAGE_ERRORS) 
+                                     if i not in write_csv_report._error_written_indices]
+                    if not errors_to_write:
+                        errors_to_write = []  # No new errors
+                    error_mode = 'a'
+                else:
+                    errors_to_write = PAGE_ERRORS
+                    error_mode = 'w'
+                    write_csv_report._error_written_indices = set()
+                
+                with open(errors_csv_filename, error_mode, newline='', encoding='utf-8') as errors_csvfile:
                     writer = csv.DictWriter(errors_csvfile, fieldnames=error_fieldnames)
-                    writer.writeheader()
                     
-                    for error in PAGE_ERRORS:
+                    # Write header only if creating new file
+                    if not append_mode:
+                        writer.writeheader()
+                    
+                    # Write entries and track indices
+                    error_start_index = len(write_csv_report._error_written_indices)
+                    for i, error in enumerate(errors_to_write):
+                        error_entry_index = error_start_index + i
+                        write_csv_report._error_written_indices.add(error_entry_index)
                         row = {
                             'type': error.get('type', ''),
                             'message': error.get('message', '')[:500],  # Limit length
@@ -1865,8 +1976,12 @@ def write_csv_report():
                         }
                         writer.writerow(row)
                 
-                logging.info(f"✓ Errors CSV report written to: {errors_csv_filename}")
-                logging.info(f"  Total error records: {len(PAGE_ERRORS)}")
+                if append_mode:
+                    logging.info(f"✓ Errors CSV report updated (appended): {errors_csv_filename}")
+                    logging.info(f"  Added {len(errors_to_write)} new error records (total: {len(PAGE_ERRORS)})")
+                else:
+                    logging.info(f"✓ Errors CSV report written to: {errors_csv_filename}")
+                    logging.info(f"  Total error records: {len(PAGE_ERRORS)}")
             except Exception as e:
                 logging.error(f"✗ Error writing errors CSV report: {e}")
                 import traceback
