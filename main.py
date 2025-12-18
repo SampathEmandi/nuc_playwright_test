@@ -38,7 +38,7 @@ STRESS_TEST_CONFIG = {
     'delay_between_questions': 3,  # Seconds to wait between questions within a session
     'handle_both_courses': True,  # Set to False to open only one course per session
     'course_for_questions': 1,  # Which course to open (1 or 2) - only used if handle_both_courses is False
-    'max_concurrent_contexts': 30,  # Maximum number of concurrent browser contexts (windows) across all users
+    'max_concurrent_contexts': 100,  # Maximum number of concurrent browser contexts (windows) across all users - Increased for heavy load testing
     # WebSocket Stress Configuration
     'websocket_stress_mode': False,  # Enable aggressive WebSocket stress testing
     'websocket_rapid_fire': False,  # Send questions as fast as possible (minimal delays)
@@ -114,27 +114,32 @@ USERS = [
     {
         'username': 'babug@bay6.ai',
         'password': 'devBay62025##',
-        'questions': course_1_questions[:5] + general_questions[:3],  # User's question list
+        # All course 1 questions go to course 1, all course 2 to course 2, general to both
+        'questions': course_1_questions + course_2_questions + general_questions,
     },
     {
         'username': 'deepk@bay6.ai',
         'password': 'devBay62025##',
-        'questions': course_1_questions[5:] + general_questions[3:6],  # User's question list
+        # All course 1 questions go to course 1, all course 2 to course 2, general to both
+        'questions': course_1_questions + course_2_questions + general_questions,
     },
     {
         'username': 'ctalluri@bay6.ai',
         'password': 'devBay62025##',
-        'questions': general_questions[:5] + course_1_questions[:3],  # User's question list
+        # All course 1 questions go to course 1, all course 2 to course 2, general to both
+        'questions': course_1_questions + course_2_questions + general_questions,
     },
     {
         'username': 'samuelp@bay6.ai',
         'password': 'devBay62025##',
-        'questions': course_1_questions + general_questions[:2],  # User's question list
+        # All course 1 questions go to course 1, all course 2 to course 2, general to both
+        'questions': course_1_questions + course_2_questions + general_questions,
     },
     {
         'username': 'jasleenk@bay6.ai',
         'password': 'devBay62025##',
-        'questions': general_questions + course_1_questions[:2],  # User's question list
+        # All course 1 questions go to course 1, all course 2 to course 2, general to both
+        'questions': course_1_questions + course_2_questions + general_questions,
     },
 ]
 
@@ -188,6 +193,11 @@ def select_questions_for_course(course_questions, general_questions, num_questio
 def distribute_questions_by_course(user_questions, course_1_questions, course_2_questions, general_questions):
     """Distribute user questions between Course 1 and Course 2 based on question type.
     
+    Distribution rules:
+    - Course 1 questions → Course 1 only
+    - Course 2 questions → Course 2 only
+    - General questions → BOTH courses (added to both lists)
+    
     Returns:
         dict: {
             'course_1': [list of questions for Course 1],
@@ -204,18 +214,20 @@ def distribute_questions_by_course(user_questions, course_1_questions, course_2_
     
     for question in user_questions:
         if question in course_1_set:
+            # Course 1 questions go to Course 1 only
             course_1_list.append(question)
         elif question in course_2_set:
+            # Course 2 questions go to Course 2 only
             course_2_list.append(question)
         elif question in general_set:
-            # Distribute general questions evenly between both courses
-            if len(course_1_list) <= len(course_2_list):
-                course_1_list.append(question)
-            else:
-                course_2_list.append(question)
-        else:
-            # Unknown question type - add to Course 1 by default
+            # General questions go to BOTH courses
             course_1_list.append(question)
+            course_2_list.append(question)
+        else:
+            # Unknown question type - add to both courses as fallback
+            logging.warning(f"Unknown question type, adding to both courses: {question[:50]}...")
+            course_1_list.append(question)
+            course_2_list.append(question)
     
     # Ensure both courses have at least some questions if user has questions
     if user_questions and not course_1_list and not course_2_list:
@@ -2009,11 +2021,14 @@ async def stress_test(browser, users):
     total_concurrent_sessions = len(users) * sessions_per_user
     
     # Get max concurrent contexts from config (prevents overwhelming browser/system)
-    max_contexts = STRESS_TEST_CONFIG.get('max_concurrent_contexts', 30)
+    max_contexts = STRESS_TEST_CONFIG.get('max_concurrent_contexts', 100)
     
     # Semaphore to limit concurrent context creation (prevent overwhelming browser)
-    # This ensures we don't create too many browser windows at once
-    context_semaphore = asyncio.Semaphore(min(max_contexts, total_concurrent_sessions))
+    # Use the higher of max_contexts or total_concurrent_sessions to ensure all users can run
+    # For heavy load testing, we want to allow all concurrent sessions
+    semaphore_limit = max(max_contexts, total_concurrent_sessions)
+    context_semaphore = asyncio.Semaphore(semaphore_limit)
+    logging.info(f"Semaphore configuration: limit={semaphore_limit} (max_contexts={max_contexts}, total_sessions={total_concurrent_sessions})")
     
     # Calculate total questions
     total_questions = sum(len(user.get('questions', [])) for user in users)
@@ -2025,7 +2040,12 @@ async def stress_test(browser, users):
     
     logging.info("=" * 80)
     logging.info("STRESS TEST STARTED - CONCURRENT MULTI-WINDOW MODE")
-    logging.info(f"Users: {len(users)}")
+    logging.info(f"Total Users Configured: {len(users)}")
+    logging.info(f"User List:")
+    for idx, user in enumerate(users, 1):
+        username = user.get('username', 'Unknown')
+        questions_count = len(user.get('questions', []))
+        logging.info(f"  {idx}. {username} ({questions_count} questions)")
     logging.info(f"Sessions per User: {sessions_per_user} (each user gets {sessions_per_user} browser windows)")
     logging.info(f"Total Concurrent Browser Windows: {total_concurrent_sessions}")
     logging.info(f"Total Questions Across All Users: {total_questions}")
@@ -2116,11 +2136,34 @@ async def stress_test(browser, users):
     
     total_stress_test_time = (time.time() - stress_test_start) * 1000
     
+    # Collect unique users from session results
+    users_processed = set()
+    for result in results:
+        if isinstance(result, dict):
+            session_id = result.get('session_id', '')
+            # Extract username from session_id (format: User1_Session1_username@domain.com)
+            if session_id:
+                parts = session_id.split('_')
+                if len(parts) >= 3:
+                    username = '_'.join(parts[2:])
+                    users_processed.add(username)
+    
     # Print comprehensive stress test summary
     logging.info("\n" + "=" * 80)
     logging.info("STRESS TEST SUMMARY")
     logging.info("=" * 80)
-    logging.info(f"Users: {len(users)}")
+    logging.info(f"Total Users Configured: {len(users)}")
+    logging.info(f"Users Actually Processed: {len(users_processed)}")
+    if users_processed:
+        logging.info(f"Users List:")
+        for username in sorted(users_processed):
+            logging.info(f"  - {username}")
+    if len(users_processed) < len(users):
+        missing_users = set(u.get('username', 'Unknown') for u in users) - users_processed
+        if missing_users:
+            logging.warning(f"⚠️  Warning: {len(missing_users)} user(s) were not processed:")
+            for username in sorted(missing_users):
+                logging.warning(f"  - {username}")
     logging.info(f"Sessions per User: {sessions_per_user}")
     logging.info(f"Total Sessions Executed: {len(tasks)}")
     logging.info(f"Total Successful Sessions: {successful_sessions}")
@@ -2137,8 +2180,11 @@ async def main():
     """Main function."""
     
     async with async_playwright() as p:
-        # Create browser
-        browser = await p.chromium.launch(headless=False)
+        # Create browser - NOT headless to ensure all windows are visible for monitoring
+        browser = await p.chromium.launch(
+            headless=False,  # Always visible for monitoring and debugging
+            args=['--start-maximized']  # Start maximized for better visibility
+        )
         
         logging.info("Browser started")
         
