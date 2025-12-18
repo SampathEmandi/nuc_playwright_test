@@ -20,6 +20,9 @@ CSV_METRICS = []
 # Global list to store page errors and warnings for CSV
 PAGE_ERRORS = []
 
+# Global list to store session-level logs and errors for CSV
+SESSION_LOGS = []
+
 # ============================================================================
 # STRESS TEST CONFIGURATION
 # ============================================================================
@@ -34,6 +37,11 @@ STRESS_TEST_CONFIG = {
     'websocket_stress_mode': False,  # Enable aggressive WebSocket stress testing
     'websocket_rapid_fire': False,  # Send questions as fast as possible (minimal delays)
     'websocket_keep_alive': True,  # Keep WebSocket connections open longer
+    # Continuous Conversation Configuration
+    'continuous_mode': True,  # Keep conversations active continuously (loop through questions)
+    'continuous_iterations': None,  # Number of question cycles to run (None = infinite until stopped)
+    'continuous_cycle_delay': 5,  # Seconds to wait between question cycles (after all questions in cycle are asked)
+    'maintain_concurrent': True,  # Maintain all conversations concurrently (don't wait for one to finish)
     # Example: 5 users × 1 session = 5 concurrent browser windows, each handling one course
 }
 
@@ -470,7 +478,123 @@ def setup_page_error_logging(page, tab_name, session_id=None, username=None):
     page.on('pageerror', handle_page_error)
     page.on('requestfailed', handle_request_failed)
 
-async def interact_with_chatbot(page, tab_name, questions=None, session_id=None, course_number=None, username=None):
+def setup_iframe_error_logging(iframe, tab_name, session_id=None, username=None):
+    """Setup logging for console messages, errors, and warnings from iframe content.
+    
+    Args:
+        iframe: Frame object (content frame of the iframe)
+        tab_name: Name of the tab/course
+        session_id: Session identifier for logging
+        username: Username for logging
+    """
+    if iframe is None:
+        return
+    
+    # Create log prefix with session and user info
+    if session_id and username:
+        log_prefix = f"[{session_id}] [{username}] [{tab_name}] [IFRAME]"
+    elif session_id:
+        log_prefix = f"[{session_id}] [{tab_name}] [IFRAME]"
+    elif username:
+        log_prefix = f"[{username}] [{tab_name}] [IFRAME]"
+    else:
+        log_prefix = f"[{tab_name}] [IFRAME]"
+    
+    def handle_iframe_console(msg):
+        """Handle console messages from the iframe."""
+        msg_type = msg.type
+        msg_text = msg.text
+        location = f"{msg.location.get('url', 'unknown')}:{msg.location.get('lineNumber', '?')}:{msg.location.get('columnNumber', '?')}"
+        
+        if msg_type == 'error':
+            logging.error(f"{log_prefix} [CONSOLE ERROR] {msg_text}")
+            logging.error(f"{log_prefix}   Location: {location}")
+            if msg.args:
+                try:
+                    args_text = ' '.join([str(arg) for arg in msg.args])
+                    logging.error(f"{log_prefix}   Args: {args_text}")
+                except:
+                    pass
+            # Store in PAGE_ERRORS for CSV
+            PAGE_ERRORS.append({
+                'type': 'IFRAME_CONSOLE_ERROR',
+                'message': msg_text,
+                'location': location,
+                'tab_name': tab_name,
+                'session_id': session_id or '',
+                'username': username or '',
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+            })
+        elif msg_type == 'warning':
+            logging.warning(f"{log_prefix} [CONSOLE WARNING] {msg_text}")
+            logging.warning(f"{log_prefix}   Location: {location}")
+            # Store in PAGE_ERRORS for CSV
+            PAGE_ERRORS.append({
+                'type': 'IFRAME_CONSOLE_WARNING',
+                'message': msg_text,
+                'location': location,
+                'tab_name': tab_name,
+                'session_id': session_id or '',
+                'username': username or '',
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+            })
+        elif msg_type == 'log':
+            logging.info(f"{log_prefix} [CONSOLE LOG] {msg_text}")
+        else:
+            logging.info(f"{log_prefix} [CONSOLE {msg_type.upper()}] {msg_text}")
+            logging.info(f"{log_prefix}   Location: {location}")
+    
+    def handle_iframe_page_error(error):
+        """Handle JavaScript errors in the iframe."""
+        error_message = str(error)
+        error_stack = getattr(error, 'stack', None)
+        logging.error(f"{log_prefix} [PAGE ERROR] {error_message}")
+        if error_stack:
+            logging.error(f"{log_prefix}   Stack: {error_stack}")
+        # Store in PAGE_ERRORS for CSV
+        PAGE_ERRORS.append({
+            'type': 'IFRAME_PAGE_ERROR',
+            'message': error_message,
+            'stack': error_stack if error_stack else '',
+            'tab_name': tab_name,
+            'session_id': session_id or '',
+            'username': username or '',
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+        })
+    
+    def handle_iframe_request_failed(request):
+        """Handle failed network requests from the iframe."""
+        url = request.url
+        failure = request.failure
+        method = request.method
+        error_text = str(failure) if failure else 'Unknown failure'
+        logging.error(f"{log_prefix} [REQUEST FAILED] {method} {url}")
+        logging.error(f"{log_prefix}   Error: {error_text}")
+        if request.post_data:
+            logging.debug(f"{log_prefix}   Post Data: {request.post_data[:200]}")  # Limit length
+        # Store in PAGE_ERRORS for CSV
+        PAGE_ERRORS.append({
+            'type': 'IFRAME_REQUEST_FAILED',
+            'message': f"{method} {url} - {error_text}",
+            'url': url,
+            'method': method,
+            'error': error_text,
+            'tab_name': tab_name,
+            'session_id': session_id or '',
+            'username': username or '',
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+        })
+    
+    # Attach all listeners to iframe
+    try:
+        iframe.on('console', handle_iframe_console)
+        iframe.on('pageerror', handle_iframe_page_error)
+        iframe.on('requestfailed', handle_iframe_request_failed)
+        logging.debug(f"{log_prefix} Iframe error logging setup completed")
+    except Exception as e:
+        logging.warning(f"{log_prefix} Failed to setup iframe error logging: {e}")
+
+async def interact_with_chatbot(page, tab_name, questions=None, session_id=None, course_number=None, username=None, continuous_mode=False, continuous_iterations=None):
     """Interact with chatbot on a given page.
     
     Args:
@@ -480,6 +604,8 @@ async def interact_with_chatbot(page, tab_name, questions=None, session_id=None,
         session_id: Session identifier for CSV logging
         course_number: Course number (1 or 2) for CSV logging
         username: Username for logging
+        continuous_mode: If True, continuously loop through questions
+        continuous_iterations: Number of cycles to run (None = infinite)
     """
     try:
         logging.info(f"Interacting with chatbot in {tab_name}...")
@@ -518,6 +644,9 @@ async def interact_with_chatbot(page, tab_name, questions=None, session_id=None,
         # Wait for chatbot iframe to be ready and get content frame
         iframe = await get_iframe_content_frame(page, tab_name)
         
+        # Setup iframe error and console logging to capture warnings/errors from iframe
+        setup_iframe_error_logging(iframe, tab_name, session_id=session_id, username=username)
+        
         # Wait for authorize button in iframe and click
         logging.info(f"Waiting for authorize button in {tab_name}...")
         authorize_btn = iframe.get_by_role('button', name='Authorize')
@@ -536,6 +665,9 @@ async def interact_with_chatbot(page, tab_name, questions=None, session_id=None,
         # Re-acquire the iframe in case it reloaded after authorization
         iframe = await get_iframe_content_frame(page, tab_name)
         
+        # Re-setup iframe error logging in case iframe reloaded
+        setup_iframe_error_logging(iframe, tab_name, session_id=session_id, username=username)
+        
         # Track metrics for each question
         question_metrics = []
         total_interaction_start = time.time()
@@ -547,249 +679,287 @@ async def interact_with_chatbot(page, tab_name, questions=None, session_id=None,
             questions_to_use = questions[:QUESTION_CONFIG['questions_per_session']]
         logging.info(f"[{tab_name}] Using {len(questions_to_use)} questions: {questions_to_use}")
         
-        # Interact with bot for multiple questions
-        for question_num, question in enumerate(questions_to_use, 1):
-            try:
-                logging.info(f"[{tab_name}] ========== Question {question_num} ==========")
-                question_start = time.time()
-                
-                # Re-acquire iframe for each question in case it changed
+        # Continuous mode: loop through questions multiple times
+        cycle_count = 0
+        cycle_delay = STRESS_TEST_CONFIG.get('continuous_cycle_delay', 5)
+        
+        if continuous_mode:
+            logging.info(f"[{tab_name}] Continuous mode enabled - will loop through questions continuously")
+            if continuous_iterations:
+                logging.info(f"[{tab_name}] Will run {continuous_iterations} cycles")
+            else:
+                logging.info(f"[{tab_name}] Will run infinite cycles until stopped")
+        
+        while True:
+            cycle_count += 1
+            if continuous_mode:
+                logging.info(f"[{tab_name}] ========== Starting Question Cycle {cycle_count} ==========")
+            
+            # Interact with bot for multiple questions
+            for question_num, question in enumerate(questions_to_use, 1):
                 try:
-                    iframe = await get_iframe_content_frame(page, tab_name)
-                except Exception as e:
-                    logging.warning(f"[{tab_name}] Could not get iframe for question {question_num}, refreshing and retrying...")
+                    logging.info(f"[{tab_name}] ========== Question {question_num} ==========")
+                    question_start = time.time()
+                    
+                    # Re-acquire iframe for each question in case it changed
                     try:
-                        # Refresh page and retry
-                        await page.reload(wait_until='domcontentloaded', timeout=30000)
-                        await asyncio.sleep(2)
                         iframe = await get_iframe_content_frame(page, tab_name)
-                        logging.info(f"[{tab_name}] Successfully got iframe after refresh")
-                    except Exception as retry_error:
-                        logging.error(f"[{tab_name}] Failed to get iframe even after refresh: {retry_error}")
+                        # Re-setup iframe error logging in case iframe reloaded
+                        setup_iframe_error_logging(iframe, tab_name, session_id=session_id, username=username)
+                    except Exception as e:
+                        logging.warning(f"[{tab_name}] Could not get iframe for question {question_num}, refreshing and retrying...")
+                        try:
+                            # Refresh page and retry
+                            await page.reload(wait_until='domcontentloaded', timeout=30000)
+                            await asyncio.sleep(2)
+                            iframe = await get_iframe_content_frame(page, tab_name)
+                            logging.info(f"[{tab_name}] Successfully got iframe after refresh")
+                        except Exception as retry_error:
+                            logging.error(f"[{tab_name}] Failed to get iframe even after refresh: {retry_error}")
+                            question_metrics.append({
+                                'question_number': question_num,
+                                'question': question,
+                                'question_submit_time': 0,
+                                'response_wait_time': 0,
+                                'question_total_time': 0,
+                                'response_received': False,
+                                'error': f'Could not get iframe after refresh: {str(retry_error)}'
+                            })
+                            continue
+                    
+                    # Wait for question box to be ready with robust retry logic and refresh on error
+                    question_box = None
+                    for attempt in range(10):  # More attempts for better reliability
+                        try:
+                            # Re-acquire iframe first (it might have reloaded)
+                            iframe = await get_iframe_content_frame(page, tab_name)
+                            # Re-setup iframe error logging in case iframe reloaded
+                            setup_iframe_error_logging(iframe, tab_name, session_id=session_id, username=username)
+                            
+                            # Try to find question box with multiple strategies
+                            question_box = iframe.get_by_role('textbox', name='Enter your question here')
+                            
+                            # Wait for it to be visible and enabled
+                            await question_box.wait_for(state='visible', timeout=15000)
+                            
+                            # Verify it's actually usable
+                            is_visible = await question_box.is_visible()
+                            is_enabled = await question_box.is_enabled()
+                            
+                            if is_visible and is_enabled:
+                                logging.info(f"[{tab_name}] Question box found and ready on attempt {attempt + 1}")
+                                break
+                            else:
+                                raise Exception(f"Question box not usable: visible={is_visible}, enabled={is_enabled}")
+                                
+                        except Exception as e:
+                            logging.debug(f"[{tab_name}] Attempt {attempt + 1} to find question box for question {question_num} failed: {e}")
+                            if attempt < 9:
+                                # Refresh page and retry iframe access on error
+                                if attempt >= 3:  # After 3 failed attempts, try refreshing
+                                    logging.info(f"[{tab_name}] Refreshing page due to iframe/question box error...")
+                                    try:
+                                        await page.reload(wait_until='domcontentloaded', timeout=30000)
+                                        await asyncio.sleep(2)  # Wait for page to stabilize
+                                        # Re-click chatbot button after refresh
+                                        try:
+                                            chatbot_btn = page.locator('._chatbot_btn_in_iframe')
+                                            await chatbot_btn.wait_for(state='visible', timeout=10000)
+                                            await chatbot_btn.click(timeout=5000)
+                                            await asyncio.sleep(2)  # Wait for chatbot to load
+                                        except:
+                                            pass  # Chatbot might already be open
+                                    except Exception as refresh_error:
+                                        logging.warning(f"[{tab_name}] Page refresh failed: {refresh_error}")
+                                
+                                # Progressive backoff: wait longer with each attempt
+                                wait_time = 1 + (attempt * 0.5)  # 1, 1.5, 2, 2.5, 3... seconds
+                                await asyncio.sleep(wait_time)
+                            else:
+                                logging.warning(f"[{tab_name}] Could not find question box for question {question_num} after {attempt + 1} attempts")
+                                question_box = None
+                    
+                    if question_box is None:
+                        logging.warning(f"[{tab_name}] Skipping question {question_num} - question box not available")
                         question_metrics.append({
                             'question_number': question_num,
                             'question': question,
                             'question_submit_time': 0,
                             'response_wait_time': 0,
-                            'question_total_time': 0,
+                            'question_total_time': (time.time() - question_start) * 1000,
                             'response_received': False,
-                            'error': f'Could not get iframe after refresh: {str(retry_error)}'
+                            'error': 'Question box not available'
                         })
                         continue
-                
-                # Wait for question box to be ready with robust retry logic and refresh on error
-                question_box = None
-                for attempt in range(10):  # More attempts for better reliability
+                    
+                    # Clear previous question if any
                     try:
-                        # Re-acquire iframe first (it might have reloaded)
-                        iframe = await get_iframe_content_frame(page, tab_name)
-                        
-                        # Try to find question box with multiple strategies
-                        question_box = iframe.get_by_role('textbox', name='Enter your question here')
-                        
-                        # Wait for it to be visible and enabled
-                        await question_box.wait_for(state='visible', timeout=15000)
-                        
-                        # Verify it's actually usable
-                        is_visible = await question_box.is_visible()
-                        is_enabled = await question_box.is_enabled()
-                        
-                        if is_visible and is_enabled:
-                            logging.info(f"[{tab_name}] Question box found and ready on attempt {attempt + 1}")
-                            break
-                        else:
-                            raise Exception(f"Question box not usable: visible={is_visible}, enabled={is_enabled}")
-                            
+                        await question_box.click()
+                        await question_box.fill('')  # Clear field
                     except Exception as e:
-                        logging.debug(f"[{tab_name}] Attempt {attempt + 1} to find question box for question {question_num} failed: {e}")
-                        if attempt < 9:
-                            # Refresh page and retry iframe access on error
-                            if attempt >= 3:  # After 3 failed attempts, try refreshing
-                                logging.info(f"[{tab_name}] Refreshing page due to iframe/question box error...")
-                                try:
-                                    await page.reload(wait_until='domcontentloaded', timeout=30000)
-                                    await asyncio.sleep(2)  # Wait for page to stabilize
-                                    # Re-click chatbot button after refresh
-                                    try:
-                                        chatbot_btn = page.locator('._chatbot_btn_in_iframe')
-                                        await chatbot_btn.wait_for(state='visible', timeout=10000)
-                                        await chatbot_btn.click(timeout=5000)
-                                        await asyncio.sleep(2)  # Wait for chatbot to load
-                                    except:
-                                        pass  # Chatbot might already be open
-                                except Exception as refresh_error:
-                                    logging.warning(f"[{tab_name}] Page refresh failed: {refresh_error}")
+                        logging.debug(f"[{tab_name}] Could not clear question box: {e}")
+                    
+                    # Time the question submission
+                    question_submit_start = time.time()
+                    await question_box.fill(question)
+                    await question_box.press('Enter')  # Submit question
+                    question_submit_time = (time.time() - question_submit_start) * 1000
+                    logging.info(f"[{tab_name}] Question {question_num} - Question: {question}")
+                    logging.info(f"[{tab_name}] Question {question_num} - Question submission time: {question_submit_time:.2f}ms")
+                    
+                    # Wait for bot response - monitor for response indicators
+                    logging.info(f"[{tab_name}] Question {question_num} - Waiting for bot response...")
+                    response_wait_start = time.time()
+                    
+                    # Dynamic wait for response - check periodically if response appeared
+                    min_wait = QUESTION_CONFIG['min_response_wait']
+                    max_wait = QUESTION_CONFIG['max_response_wait']
+                    check_interval = QUESTION_CONFIG['response_check_interval']
+                    waited_time = 0
+                    response_received = False
+                    
+                    # Wait minimum time first
+                    await asyncio.sleep(min_wait)
+                    waited_time = min_wait
+                    
+                    # Then check periodically for response - verify after each question
+                    while waited_time < max_wait:
+                        try:
+                            # Re-acquire iframe in case it reloaded
+                            try:
+                                iframe = await get_iframe_content_frame(page, tab_name)
+                                # Re-setup iframe error logging in case iframe reloaded
+                                setup_iframe_error_logging(iframe, tab_name, session_id=session_id, username=username)
+                            except:
+                                pass
                             
-                            # Progressive backoff: wait longer with each attempt
-                            wait_time = 1 + (attempt * 0.5)  # 1, 1.5, 2, 2.5, 3... seconds
-                            await asyncio.sleep(wait_time)
+                            # Try to detect if response appeared by checking if question box is ready again
+                            question_box_check = iframe.get_by_role('textbox', name='Enter your question here')
+                            is_visible = await question_box_check.is_visible()
+                            is_enabled = await question_box_check.is_enabled()
+                            
+                            # If question box is visible and enabled after minimum wait, response likely completed
+                            if waited_time >= min_wait and is_visible and is_enabled:
+                                # Additional check: verify response is complete by checking if we can interact
+                                try:
+                                    # Try to click/focus the question box to ensure UI is ready
+                                    await question_box_check.click(timeout=2000)
+                                    await asyncio.sleep(1)  # Small delay to ensure response is fully rendered
+                                    response_received = True
+                                    logging.info(f"[{tab_name}] Question {question_num} - Response detected and verified after {waited_time + 1}s")
+                                    break
+                                except Exception as e:
+                                    logging.debug(f"[{tab_name}] Question {question_num} - Response check interaction failed: {e}")
+                                    # Continue waiting
+                        except Exception as e:
+                            logging.debug(f"[{tab_name}] Question {question_num} - Error checking response: {e}")
+                        
+                        await asyncio.sleep(check_interval)
+                        waited_time += check_interval
+                    
+                    # If we've reached max wait time, assume response received
+                    if not response_received and waited_time >= max_wait:
+                        response_received = True
+                        logging.info(f"[{tab_name}] Question {question_num} - Max wait time reached, assuming response received")
+                    
+                    # Wait additional time after response to ensure UI is ready for next question
+                    if response_received:
+                        logging.info(f"[{tab_name}] Question {question_num} - Waiting for UI to stabilize after response...")
+                        await asyncio.sleep(2)  # Give UI time to stabilize
+                    
+                    response_wait_time = (time.time() - response_wait_start) * 1000
+                    question_total_time = (time.time() - question_start) * 1000
+                    
+                    question_metric = {
+                        'question_number': question_num,
+                        'question': question,
+                        'question_submit_time': question_submit_time,
+                        'response_wait_time': response_wait_time,
+                        'question_total_time': question_total_time,
+                        'response_received': response_received
+                    }
+                    question_metrics.append(question_metric)
+                    
+                    # Store in CSV metrics if session_id and course_number provided
+                    if session_id and course_number:
+                        CSV_METRICS.append({
+                            'session_id': session_id,
+                            'course_number': course_number,
+                            'question_number': question_num,
+                            'question_text': question[:200] if len(question) > 200 else question,  # Limit length
+                            'question_submit_time_ms': round(question_submit_time, 2),
+                            'response_wait_time_ms': round(response_wait_time, 2),
+                            'question_total_time_ms': round(question_total_time, 2),
+                            'response_received': response_received,
+                            'error': '',
+                            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+                        })
+                    
+                    logging.info(f"[{tab_name}] Question {question_num} - Response wait time: {response_wait_time:.2f}ms")
+                    logging.info(f"[{tab_name}] Question {question_num} - Total question time: {question_total_time:.2f}ms")
+                    logging.info(f"[{tab_name}] Question {question_num} - Response received: {response_received}")
+                    
+                    # Delay between questions - configurable for WebSocket stress testing
+                    if question_num < len(questions_to_use):
+                        # Check if rapid fire mode is enabled for WebSocket stress
+                        if STRESS_TEST_CONFIG.get('websocket_rapid_fire', False):
+                            # Minimal delay - just enough for UI to be ready
+                            delay = 0.5
+                            logging.info(f"[{tab_name}] Rapid fire mode - minimal delay ({delay}s) before next question...")
                         else:
-                            logging.warning(f"[{tab_name}] Could not find question box for question {question_num} after {attempt + 1} attempts")
-                            question_box = None
-                
-                if question_box is None:
-                    logging.warning(f"[{tab_name}] Skipping question {question_num} - question box not available")
-                    question_metrics.append({
+                            # Use configured delay
+                            delay = STRESS_TEST_CONFIG.get('delay_between_questions', 3)
+                            logging.info(f"[{tab_name}] Waiting {delay}s before next question...")
+                        await asyncio.sleep(delay)
+                        
+                except Exception as question_error:
+                    logging.error(f"[{tab_name}] Error in question {question_num}: {question_error}")
+                    question_total_time = (time.time() - question_start) * 1000 if 'question_start' in locals() else 0
+                    question_metric = {
                         'question_number': question_num,
                         'question': question,
                         'question_submit_time': 0,
                         'response_wait_time': 0,
-                        'question_total_time': (time.time() - question_start) * 1000,
+                        'question_total_time': question_total_time,
                         'response_received': False,
-                        'error': 'Question box not available'
-                    })
+                        'error': str(question_error)
+                    }
+                    question_metrics.append(question_metric)
+                    
+                    # Store error in CSV metrics
+                    if session_id and course_number:
+                        CSV_METRICS.append({
+                            'session_id': session_id,
+                            'course_number': course_number,
+                            'question_number': question_num,
+                            'question_text': question,
+                            'question_submit_time_ms': 0,
+                            'response_wait_time_ms': 0,
+                            'question_total_time_ms': round(question_total_time, 2),
+                            'response_received': False,
+                            'error': str(question_error),
+                            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+                        })
+                    # Wait before trying next question
+                    if question_num < len(questions_to_use):
+                        await asyncio.sleep(2)
                     continue
-                
-                # Clear previous question if any
-                try:
-                    await question_box.click()
-                    await question_box.fill('')  # Clear field
-                except Exception as e:
-                    logging.debug(f"[{tab_name}] Could not clear question box: {e}")
-                
-                # Time the question submission
-                question_submit_start = time.time()
-                await question_box.fill(question)
-                await question_box.press('Enter')  # Submit question
-                question_submit_time = (time.time() - question_submit_start) * 1000
-                logging.info(f"[{tab_name}] Question {question_num} - Question: {question}")
-                logging.info(f"[{tab_name}] Question {question_num} - Question submission time: {question_submit_time:.2f}ms")
-                
-                # Wait for bot response - monitor for response indicators
-                logging.info(f"[{tab_name}] Question {question_num} - Waiting for bot response...")
-                response_wait_start = time.time()
-                
-                # Dynamic wait for response - check periodically if response appeared
-                min_wait = QUESTION_CONFIG['min_response_wait']
-                max_wait = QUESTION_CONFIG['max_response_wait']
-                check_interval = QUESTION_CONFIG['response_check_interval']
-                waited_time = 0
-                response_received = False
-                
-                # Wait minimum time first
-                await asyncio.sleep(min_wait)
-                waited_time = min_wait
-                
-                # Then check periodically for response - verify after each question
-                while waited_time < max_wait:
-                    try:
-                        # Re-acquire iframe in case it reloaded
-                        try:
-                            iframe = await get_iframe_content_frame(page, tab_name)
-                        except:
-                            pass
-                        
-                        # Try to detect if response appeared by checking if question box is ready again
-                        question_box_check = iframe.get_by_role('textbox', name='Enter your question here')
-                        is_visible = await question_box_check.is_visible()
-                        is_enabled = await question_box_check.is_enabled()
-                        
-                        # If question box is visible and enabled after minimum wait, response likely completed
-                        if waited_time >= min_wait and is_visible and is_enabled:
-                            # Additional check: verify response is complete by checking if we can interact
-                            try:
-                                # Try to click/focus the question box to ensure UI is ready
-                                await question_box_check.click(timeout=2000)
-                                await asyncio.sleep(1)  # Small delay to ensure response is fully rendered
-                                response_received = True
-                                logging.info(f"[{tab_name}] Question {question_num} - Response detected and verified after {waited_time + 1}s")
-                                break
-                            except Exception as e:
-                                logging.debug(f"[{tab_name}] Question {question_num} - Response check interaction failed: {e}")
-                                # Continue waiting
-                    except Exception as e:
-                        logging.debug(f"[{tab_name}] Question {question_num} - Error checking response: {e}")
-                    
-                    await asyncio.sleep(check_interval)
-                    waited_time += check_interval
-                
-                # If we've reached max wait time, assume response received
-                if not response_received and waited_time >= max_wait:
-                    response_received = True
-                    logging.info(f"[{tab_name}] Question {question_num} - Max wait time reached, assuming response received")
-                
-                # Wait additional time after response to ensure UI is ready for next question
-                if response_received:
-                    logging.info(f"[{tab_name}] Question {question_num} - Waiting for UI to stabilize after response...")
-                    await asyncio.sleep(2)  # Give UI time to stabilize
-                
-                response_wait_time = (time.time() - response_wait_start) * 1000
-                question_total_time = (time.time() - question_start) * 1000
-                
-                question_metric = {
-                    'question_number': question_num,
-                    'question': question,
-                    'question_submit_time': question_submit_time,
-                    'response_wait_time': response_wait_time,
-                    'question_total_time': question_total_time,
-                    'response_received': response_received
-                }
-                question_metrics.append(question_metric)
-                
-                # Store in CSV metrics if session_id and course_number provided
-                if session_id and course_number:
-                    CSV_METRICS.append({
-                        'session_id': session_id,
-                        'course_number': course_number,
-                        'question_number': question_num,
-                        'question_text': question[:200] if len(question) > 200 else question,  # Limit length
-                        'question_submit_time_ms': round(question_submit_time, 2),
-                        'response_wait_time_ms': round(response_wait_time, 2),
-                        'question_total_time_ms': round(question_total_time, 2),
-                        'response_received': response_received,
-                        'error': '',
-                        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
-                    })
-                
-                logging.info(f"[{tab_name}] Question {question_num} - Response wait time: {response_wait_time:.2f}ms")
-                logging.info(f"[{tab_name}] Question {question_num} - Total question time: {question_total_time:.2f}ms")
-                logging.info(f"[{tab_name}] Question {question_num} - Response received: {response_received}")
-                
-                # Delay between questions - configurable for WebSocket stress testing
-                if question_num < len(questions_to_use):
-                    # Check if rapid fire mode is enabled for WebSocket stress
-                    if STRESS_TEST_CONFIG.get('websocket_rapid_fire', False):
-                        # Minimal delay - just enough for UI to be ready
-                        delay = 0.5
-                        logging.info(f"[{tab_name}] Rapid fire mode - minimal delay ({delay}s) before next question...")
-                    else:
-                        # Use configured delay
-                        delay = STRESS_TEST_CONFIG.get('delay_between_questions', 3)
-                        logging.info(f"[{tab_name}] Waiting {delay}s before next question...")
-                    await asyncio.sleep(delay)
-                    
-            except Exception as question_error:
-                logging.error(f"[{tab_name}] Error in question {question_num}: {question_error}")
-                question_total_time = (time.time() - question_start) * 1000 if 'question_start' in locals() else 0
-                question_metric = {
-                    'question_number': question_num,
-                    'question': question,
-                    'question_submit_time': 0,
-                    'response_wait_time': 0,
-                    'question_total_time': question_total_time,
-                    'response_received': False,
-                    'error': str(question_error)
-                }
-                question_metrics.append(question_metric)
-                
-                # Store error in CSV metrics
-                if session_id and course_number:
-                    CSV_METRICS.append({
-                        'session_id': session_id,
-                        'course_number': course_number,
-                        'question_number': question_num,
-                        'question_text': question,
-                        'question_submit_time_ms': 0,
-                        'response_wait_time_ms': 0,
-                        'question_total_time_ms': round(question_total_time, 2),
-                        'response_received': False,
-                        'error': str(question_error),
-                        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
-                    })
-                # Wait before trying next question
-                if question_num < len(questions_to_use):
-                    await asyncio.sleep(2)
-                continue
+            
+            # After completing all questions in cycle
+            if continuous_mode:
+                # Check if we should continue
+                if continuous_iterations and cycle_count >= continuous_iterations:
+                    logging.info(f"[{tab_name}] Completed {cycle_count} cycles (requested: {continuous_iterations}), stopping continuous mode")
+                    break
+                else:
+                    logging.info(f"[{tab_name}] Completed cycle {cycle_count}, waiting {cycle_delay}s before next cycle...")
+                    await asyncio.sleep(cycle_delay)
+                    # Shuffle questions for next cycle to add variety
+                    random.shuffle(questions_to_use)
+                    logging.info(f"[{tab_name}] Starting next cycle with shuffled questions")
+            else:
+                # Not in continuous mode, exit after one cycle
+                break
         
         total_interaction_time = (time.time() - total_interaction_start) * 1000
         
@@ -872,13 +1042,33 @@ async def run_user_session(context, user, questions=None, handle_both_courses=Tr
     if questions:
         logging.info(f"{log_prefix} Questions to ask: {questions}")
     
-        # Check if context is still valid
-        try:
-            if context.browser and not context.browser.is_connected():
-                raise Exception("Browser is not connected")
-        except Exception as e:
-            logging.error(f"{log_prefix} ✗ Context invalid: {e}")
-            return
+    # Log session start in user session
+    log_session_event(
+        session_id, 
+        'INFO', 
+        f'User session started - {len(questions)} questions, handle_both_courses={handle_both_courses}',
+        username=username,
+        stage='user_session_start',
+        questions_count=len(questions),
+        handle_both_courses=handle_both_courses
+    )
+    
+    # Check if context is still valid
+    try:
+        if context.browser and not context.browser.is_connected():
+            raise Exception("Browser is not connected")
+    except Exception as e:
+        error_msg = f"Context invalid: {str(e)}"
+        log_session_event(
+            session_id, 
+            'ERROR', 
+            error_msg,
+            error=str(e),
+            username=username,
+            stage='context_validation'
+        )
+        logging.error(f"{log_prefix} ✗ {error_msg}")
+        return
     
     # Create login page
     login_page = None
@@ -906,22 +1096,42 @@ async def run_user_session(context, user, questions=None, handle_both_courses=Tr
         # Login
         logging.info(f"{log_prefix} Logging in...")
         login_start_time = time.time()
+        log_session_event(
+            session_id, 
+            'INFO', 
+            'Starting login process',
+            username=username,
+            stage='login_start'
+        )
         # Check again before navigation
         if context.browser and not context.browser.is_connected():
             raise Exception("Browser disconnected before navigation")
         
-        await login_page.goto('https://development.instructure.com/login/ldap', wait_until='domcontentloaded', timeout=60000)
-        
-        await login_page.fill("#pseudonym_session_unique_id", username)
-        await login_page.fill("#pseudonym_session_password", password)
-        
-        # Click login button
-        await login_page.click("#login_form > div.ic-Login__actions > div.ic-Form-control.ic-Form-control--login > input")
-        
-        # Wait for dashboard to load - wait for both course cards to be visible (with retry)
-        logging.info(f"{log_prefix} Waiting for dashboard to load...")
-        dashboard_locator = login_page.locator('#DashboardCard_Container')
-        await dashboard_locator.wait_for(state='visible', timeout=60000)
+        try:
+            await login_page.goto('https://development.instructure.com/login/ldap', wait_until='domcontentloaded', timeout=60000)
+            
+            await login_page.fill("#pseudonym_session_unique_id", username)
+            await login_page.fill("#pseudonym_session_password", password)
+            
+            # Click login button
+            await login_page.click("#login_form > div.ic-Login__actions > div.ic-Form-control.ic-Form-control--login > input")
+            
+            # Wait for dashboard to load - wait for both course cards to be visible (with retry)
+            logging.info(f"{log_prefix} Waiting for dashboard to load...")
+            dashboard_locator = login_page.locator('#DashboardCard_Container')
+            await dashboard_locator.wait_for(state='visible', timeout=60000)
+        except Exception as login_error:
+            import traceback
+            log_session_event(
+                session_id, 
+                'ERROR', 
+                f'Login failed: {str(login_error)}',
+                error=str(login_error),
+                traceback_text=traceback.format_exc(),
+                username=username,
+                stage='login_process'
+            )
+            raise
         
         # Wait for both course cards to be visible with retry logic
         logging.info(f"{log_prefix} Waiting for Course 1 and Course 2 cards to be visible...")
@@ -951,12 +1161,27 @@ async def run_user_session(context, user, questions=None, handle_both_courses=Tr
         logging.info(f"{log_prefix} Dashboard loaded successfully")
         login_end_time = time.time()
         login_time_ms = (login_end_time - login_start_time) * 1000 if login_start_time else 0
+        log_session_event(
+            session_id, 
+            'INFO', 
+            f'Login completed successfully in {login_time_ms:.2f}ms',
+            username=username,
+            stage='login_complete',
+            login_time_ms=round(login_time_ms, 2)
+        )
         
         # Close login page (no longer needed)
         await login_page.close()
         
         session_start = time.time()
         course_open_start_time = time.time()
+        log_session_event(
+            session_id, 
+            'INFO', 
+            'Starting course opening process',
+            username=username,
+            stage='course_open_start'
+        )
         
         # Get course number from config (default to 1)
         course_number = STRESS_TEST_CONFIG.get('course_for_questions', 1) if not handle_both_courses else 1
@@ -986,42 +1211,136 @@ async def run_user_session(context, user, questions=None, handle_both_courses=Tr
             )
             course_open_end_time = time.time()
             course_open_time_ms = (course_open_end_time - course_open_start_time) * 1000 if course_open_start_time else 0
+            log_session_event(
+                session_id, 
+                'INFO', 
+                f'Courses opened successfully in {course_open_time_ms:.2f}ms - Course 1: {len(course_1_questions_list)} questions, Course 2: {len(course_2_questions_list)} questions',
+                username=username,
+                stage='course_open_complete',
+                course_open_time_ms=round(course_open_time_ms, 2),
+                course_1_questions=len(course_1_questions_list),
+                course_2_questions=len(course_2_questions_list)
+            )
             
             # Run chatbot interactions concurrently for both courses
             chatbot_tasks = []
+            continuous_mode = STRESS_TEST_CONFIG.get('continuous_mode', False)
+            continuous_iterations = STRESS_TEST_CONFIG.get('continuous_iterations', None)
             
             if course_1_questions_list:
                 chatbot_tasks.append(
-                    interact_with_chatbot(course_1_page, "Course 1", course_1_questions_list, session_id=session_id, course_number=1, username=username)
+                    interact_with_chatbot(course_1_page, "Course 1", course_1_questions_list, session_id=session_id, course_number=1, username=username, continuous_mode=continuous_mode, continuous_iterations=continuous_iterations)
                 )
             
             if course_2_questions_list:
                 chatbot_tasks.append(
-                    interact_with_chatbot(course_2_page, "Course 2", course_2_questions_list, session_id=session_id, course_number=2, username=username)
+                    interact_with_chatbot(course_2_page, "Course 2", course_2_questions_list, session_id=session_id, course_number=2, username=username, continuous_mode=continuous_mode, continuous_iterations=continuous_iterations)
                 )
             
             if chatbot_tasks:
                 logging.info(f"{log_prefix} Starting concurrent chatbot interactions for both courses...")
+                log_session_event(
+                    session_id, 
+                    'INFO', 
+                    'Starting chatbot interactions for both courses concurrently',
+                    username=username,
+                    stage='chatbot_interaction_start'
+                )
                 chatbot_start = time.time()
-                await asyncio.gather(*chatbot_tasks, return_exceptions=True)
-                chatbot_total_time = (time.time() - chatbot_start) * 1000
-                logging.info(f"{log_prefix} ✓ All questions answered in both courses in {chatbot_total_time:.2f}ms")
+                try:
+                    await asyncio.gather(*chatbot_tasks, return_exceptions=True)
+                    chatbot_total_time = (time.time() - chatbot_start) * 1000
+                    logging.info(f"{log_prefix} ✓ All questions answered in both courses in {chatbot_total_time:.2f}ms")
+                    log_session_event(
+                        session_id, 
+                        'INFO', 
+                        f'Chatbot interactions completed in {chatbot_total_time:.2f}ms',
+                        username=username,
+                        stage='chatbot_interaction_complete',
+                        chatbot_time_ms=round(chatbot_total_time, 2)
+                    )
+                except Exception as chatbot_error:
+                    import traceback
+                    chatbot_total_time = (time.time() - chatbot_start) * 1000
+                    log_session_event(
+                        session_id, 
+                        'ERROR', 
+                        f'Chatbot interaction failed: {str(chatbot_error)}',
+                        error=str(chatbot_error),
+                        traceback_text=traceback.format_exc(),
+                        username=username,
+                        stage='chatbot_interaction_error',
+                        chatbot_time_ms=round(chatbot_total_time, 2)
+                    )
+                    raise
         else:
             # Single course mode - open only one course per session
             logging.info(f"{log_prefix} Opening course {course_number} (single course mode)...")
             course_1_page = await open_course(context, course_number, f"Course {course_number}")
             course_open_end_time = time.time()
             course_open_time_ms = (course_open_end_time - course_open_start_time) * 1000 if course_open_start_time else 0
+            log_session_event(
+                session_id, 
+                'INFO', 
+                f'Course {course_number} opened successfully in {course_open_time_ms:.2f}ms',
+                username=username,
+                stage='course_open_complete',
+                course_open_time_ms=round(course_open_time_ms, 2),
+                course_number=course_number
+            )
             
             if questions:
                 logging.info(f"{log_prefix} Asking {len(questions)} question(s) in Course {course_number}...")
+                log_session_event(
+                    session_id, 
+                    'INFO', 
+                    f'Starting chatbot interactions for Course {course_number}',
+                    username=username,
+                    stage='chatbot_interaction_start',
+                    course_number=course_number
+                )
                 chatbot_start = time.time()
-                await interact_with_chatbot(course_1_page, f"Course {course_number}", questions, session_id=session_id, course_number=course_number, username=username)
-                chatbot_total_time = (time.time() - chatbot_start) * 1000
-                logging.info(f"{log_prefix} ✓ All questions answered in Course {course_number} in {chatbot_total_time:.2f}ms")
+                continuous_mode = STRESS_TEST_CONFIG.get('continuous_mode', False)
+                continuous_iterations = STRESS_TEST_CONFIG.get('continuous_iterations', None)
+                try:
+                    await interact_with_chatbot(course_1_page, f"Course {course_number}", questions, session_id=session_id, course_number=course_number, username=username, continuous_mode=continuous_mode, continuous_iterations=continuous_iterations)
+                    chatbot_total_time = (time.time() - chatbot_start) * 1000
+                    logging.info(f"{log_prefix} ✓ All questions answered in Course {course_number} in {chatbot_total_time:.2f}ms")
+                    log_session_event(
+                        session_id, 
+                        'INFO', 
+                        f'Chatbot interactions completed for Course {course_number} in {chatbot_total_time:.2f}ms',
+                        username=username,
+                        stage='chatbot_interaction_complete',
+                        course_number=course_number,
+                        chatbot_time_ms=round(chatbot_total_time, 2)
+                    )
+                except Exception as chatbot_error:
+                    import traceback
+                    chatbot_total_time = (time.time() - chatbot_start) * 1000
+                    log_session_event(
+                        session_id, 
+                        'ERROR', 
+                        f'Chatbot interaction failed for Course {course_number}: {str(chatbot_error)}',
+                        error=str(chatbot_error),
+                        traceback_text=traceback.format_exc(),
+                        username=username,
+                        stage='chatbot_interaction_error',
+                        course_number=course_number,
+                        chatbot_time_ms=round(chatbot_total_time, 2)
+                    )
+                    raise
         
         session_total_time = (time.time() - session_start) * 1000
         logging.info(f"{log_prefix} ✓ Session completed in {session_total_time:.2f}ms")
+        log_session_event(
+            session_id, 
+            'INFO', 
+            f'User session completed successfully - Total time: {session_total_time:.2f}ms',
+            username=username,
+            stage='user_session_complete',
+            session_total_time_ms=round(session_total_time, 2)
+        )
         
         # Store session summary in CSV metrics
         if session_id:
@@ -1041,10 +1360,21 @@ async def run_user_session(context, user, questions=None, handle_both_courses=Tr
             })
         
     except Exception as e:
-        logging.error(f"{log_prefix} ✗ Error: {e}")
         import traceback
+        error_msg = str(e)
+        traceback_text = traceback.format_exc()
+        logging.error(f"{log_prefix} ✗ Error: {error_msg}")
         logging.error(f"✗ Full error traceback for {username}:")
-        logging.error(traceback.format_exc())
+        logging.error(traceback_text)
+        log_session_event(
+            session_id, 
+            'ERROR', 
+            f'User session error: {error_msg}',
+            error=error_msg,
+            traceback_text=traceback_text,
+            username=username,
+            stage='user_session_error'
+        )
         # Don't close context here - let run_session_with_context handle it
         raise  # Re-raise to let run_session_with_context handle cleanup
     finally:
@@ -1077,6 +1407,30 @@ async def run_user_session(context, user, questions=None, handle_both_courses=Tr
             except Exception as e:
                 logging.debug(f"Error closing page (may be already closed): {e}")
 
+def log_session_event(session_id, event_type, message, error=None, traceback_text=None, username=None, **kwargs):
+    """Log a session-level event to SESSION_LOGS for CSV export.
+    
+    Args:
+        session_id: Session identifier
+        event_type: Type of event (e.g., 'SESSION_START', 'SESSION_END', 'ERROR', 'WARNING', 'INFO')
+        message: Event message
+        error: Error message if applicable
+        traceback_text: Full traceback if applicable
+        username: Username associated with session
+        **kwargs: Additional metadata
+    """
+    import traceback as tb
+    SESSION_LOGS.append({
+        'session_id': session_id,
+        'username': username or '',
+        'event_type': event_type,
+        'message': message,
+        'error': error or '',
+        'traceback': traceback_text or '',
+        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
+        **kwargs
+    })
+
 async def run_session_with_context(browser, user, session_id, questions=None, question=None, handle_both_courses=True, semaphore=None):
     """Run a user session with its own browser context to ask questions.
     
@@ -1086,6 +1440,19 @@ async def run_session_with_context(browser, user, session_id, questions=None, qu
         handle_both_courses: If True, opens both Course 1 and Course 2 and chats concurrently
     """
     context = None
+    session_start_time = time.time()
+    username = user.get('username', '')
+    
+    # Log session start
+    log_session_event(
+        session_id, 
+        'SESSION_START', 
+        f'Session started for user {username}',
+        username=username,
+        questions_count=len(questions) if questions else 0,
+        handle_both_courses=handle_both_courses
+    )
+    
     if semaphore:
         await semaphore.acquire()
     
@@ -1097,53 +1464,161 @@ async def run_session_with_context(browser, user, session_id, questions=None, qu
         # Check if browser is still open before proceeding
         try:
             if not browser.is_connected():
-                logging.error(f"Session {session_id}: Browser is not connected")
-                return {'session_id': session_id, 'success': False, 'error': 'Browser not connected'}
+                error_msg = 'Browser is not connected'
+                log_session_event(
+                    session_id, 
+                    'ERROR', 
+                    error_msg,
+                    error=error_msg,
+                    username=username,
+                    stage='browser_check'
+                )
+                logging.error(f"Session {session_id}: {error_msg}")
+                return {'session_id': session_id, 'success': False, 'error': error_msg}
         except Exception as e:
-            logging.error(f"Session {session_id}: Error checking browser connection: {e}")
-            return {'session_id': session_id, 'success': False, 'error': f'Browser check failed: {str(e)}'}
+            import traceback
+            error_msg = f'Browser check failed: {str(e)}'
+            log_session_event(
+                session_id, 
+                'ERROR', 
+                error_msg,
+                error=str(e),
+                traceback_text=traceback.format_exc(),
+                username=username,
+                stage='browser_check'
+            )
+            logging.error(f"Session {session_id}: {error_msg}")
+            return {'session_id': session_id, 'success': False, 'error': error_msg}
         
         # Create a new browser context for this session (separate window)
         try:
             context = await browser.new_context()
             logging.info(f"Session {session_id}: Created new browser context")
+            log_session_event(
+                session_id, 
+                'INFO', 
+                'Browser context created successfully',
+                username=username,
+                stage='context_creation'
+            )
         except Exception as e:
-            logging.error(f"Session {session_id}: Failed to create context: {e}")
-            return {'session_id': session_id, 'success': False, 'error': f'Context creation failed: {str(e)}'}
+            import traceback
+            error_msg = f'Context creation failed: {str(e)}'
+            log_session_event(
+                session_id, 
+                'ERROR', 
+                error_msg,
+                error=str(e),
+                traceback_text=traceback.format_exc(),
+                username=username,
+                stage='context_creation'
+            )
+            logging.error(f"Session {session_id}: {error_msg}")
+            return {'session_id': session_id, 'success': False, 'error': error_msg}
         
         # Verify context was created successfully
         if context is None:
-            logging.error(f"Session {session_id}: Context is None after creation")
-            return {'session_id': session_id, 'success': False, 'error': 'Context creation returned None'}
+            error_msg = 'Context creation returned None'
+            log_session_event(
+                session_id, 
+                'ERROR', 
+                error_msg,
+                error=error_msg,
+                username=username,
+                stage='context_verification'
+            )
+            logging.error(f"Session {session_id}: {error_msg}")
+            return {'session_id': session_id, 'success': False, 'error': error_msg}
         
         # Small delay to ensure context is ready
         await asyncio.sleep(0.2)
         
         # Verify browser is still connected before running session
         if not browser.is_connected():
-            logging.error(f"Session {session_id}: Browser disconnected before session start")
-            return {'session_id': session_id, 'success': False, 'error': 'Browser disconnected'}
+            error_msg = 'Browser disconnected before session start'
+            log_session_event(
+                session_id, 
+                'ERROR', 
+                error_msg,
+                error=error_msg,
+                username=username,
+                stage='pre_session_check'
+            )
+            logging.error(f"Session {session_id}: {error_msg}")
+            return {'session_id': session_id, 'success': False, 'error': error_msg}
         
         # Run the session with the questions (handles both courses if enabled)
         try:
+            log_session_event(
+                session_id, 
+                'INFO', 
+                'Starting user session execution',
+                username=username,
+                stage='session_execution_start'
+            )
             await run_user_session(context, user, questions, handle_both_courses, session_id=session_id)
+            session_duration = (time.time() - session_start_time) * 1000
+            log_session_event(
+                session_id, 
+                'SESSION_END', 
+                f'Session completed successfully in {session_duration:.2f}ms',
+                username=username,
+                stage='session_complete',
+                session_duration_ms=round(session_duration, 2),
+                success=True
+            )
             logging.info(f"Session {session_id}: Completed successfully")
-            return {'session_id': session_id, 'success': True}
+            return {'session_id': session_id, 'success': True, 'duration_ms': session_duration}
         except Exception as session_error:
-            logging.error(f"Session {session_id}: Error during session execution: {session_error}")
             import traceback
-            logging.error(f"Session {session_id}: Traceback: {traceback.format_exc()}")
-            return {'session_id': session_id, 'success': False, 'error': str(session_error)}
+            session_duration = (time.time() - session_start_time) * 1000
+            error_msg = str(session_error)
+            traceback_text = traceback.format_exc()
+            log_session_event(
+                session_id, 
+                'ERROR', 
+                f'Session execution failed: {error_msg}',
+                error=error_msg,
+                traceback_text=traceback_text,
+                username=username,
+                stage='session_execution',
+                session_duration_ms=round(session_duration, 2),
+                success=False
+            )
+            logging.error(f"Session {session_id}: Error during session execution: {session_error}")
+            logging.error(f"Session {session_id}: Traceback: {traceback_text}")
+            return {'session_id': session_id, 'success': False, 'error': error_msg, 'duration_ms': session_duration}
     except Exception as e:
-        logging.error(f"Session {session_id}: Error setting up session: {e}")
         import traceback
+        session_duration = (time.time() - session_start_time) * 1000 if 'session_start_time' in locals() else 0
+        error_msg = str(e)
+        traceback_text = traceback.format_exc()
+        log_session_event(
+            session_id, 
+            'ERROR', 
+            f'Session setup failed: {error_msg}',
+            error=error_msg,
+            traceback_text=traceback_text,
+            username=username,
+            stage='session_setup',
+            session_duration_ms=round(session_duration, 2),
+            success=False
+        )
+        logging.error(f"Session {session_id}: Error setting up session: {e}")
         logging.error(traceback.format_exc())
-        return {'session_id': session_id, 'success': False, 'error': str(e)}
+        return {'session_id': session_id, 'success': False, 'error': error_msg, 'duration_ms': session_duration}
     finally:
         # Close the context (browser window) for this session - only after session completes or fails
         if context:
             try:
                 logging.info(f"Session {session_id}: Starting cleanup...")
+                log_session_event(
+                    session_id, 
+                    'INFO', 
+                    'Starting session cleanup',
+                    username=username,
+                    stage='cleanup_start'
+                )
                 # Check if browser is still connected before cleanup
                 if context.browser and context.browser.is_connected():
                     # Close all pages first
@@ -1155,6 +1630,14 @@ async def run_session_with_context(browser, user, session_id, questions=None, qu
                                 pages_closed += 1
                         except Exception as e:
                             logging.debug(f"Session {session_id}: Error closing page during cleanup: {e}")
+                            log_session_event(
+                                session_id, 
+                                'WARNING', 
+                                f'Error closing page during cleanup: {str(e)}',
+                                error=str(e),
+                                username=username,
+                                stage='cleanup_pages'
+                            )
                     
                     logging.info(f"Session {session_id}: Closed {pages_closed} page(s)")
                     
@@ -1165,15 +1648,121 @@ async def run_session_with_context(browser, user, session_id, questions=None, qu
                     if context.browser.is_connected():
                         await context.close()
                         logging.info(f"Session {session_id}: Closed browser context (session completed or failed)")
+                        log_session_event(
+                            session_id, 
+                            'INFO', 
+                            'Session cleanup completed successfully',
+                            username=username,
+                            stage='cleanup_complete',
+                            pages_closed=pages_closed
+                        )
                     else:
                         logging.warning(f"Session {session_id}: Browser disconnected, skipping context close")
+                        log_session_event(
+                            session_id, 
+                            'WARNING', 
+                            'Browser disconnected during cleanup, skipping context close',
+                            username=username,
+                            stage='cleanup_skip'
+                        )
                 else:
                     logging.debug(f"Session {session_id}: Browser not connected, skipping context cleanup")
+                    log_session_event(
+                        session_id, 
+                        'WARNING', 
+                        'Browser not connected, skipping context cleanup',
+                        username=username,
+                        stage='cleanup_skip'
+                    )
             except Exception as e:
+                import traceback
                 logging.warning(f"Session {session_id}: Error closing context: {e}")
+                log_session_event(
+                    session_id, 
+                    'ERROR', 
+                    f'Error during cleanup: {str(e)}',
+                    error=str(e),
+                    traceback_text=traceback.format_exc(),
+                    username=username,
+                    stage='cleanup_error'
+                )
         if semaphore:
             semaphore.release()
             logging.debug(f"Session {session_id}: Released semaphore")
+
+def write_session_logs_csv():
+    """Write session-level logs and errors to CSV file in parallel with other reports."""
+    if not SESSION_LOGS:
+        logging.warning("No session logs collected to write to CSV")
+        return
+    
+    # Generate filename with timestamp
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    session_csv_filename = f"session_logs_{timestamp}.csv"
+    
+    # Define CSV columns for session logs
+    fieldnames = [
+        'session_id',
+        'username',
+        'event_type',
+        'message',
+        'error',
+        'traceback',
+        'stage',
+        'timestamp',
+        'session_duration_ms',
+        'success',
+        'questions_count',
+        'handle_both_courses',
+        'pages_closed',
+        # Add any other dynamic fields
+    ]
+    
+    try:
+        with open(session_csv_filename, 'w', newline='', encoding='utf-8') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames, extrasaction='ignore')
+            writer.writeheader()
+            
+            for log_entry in SESSION_LOGS:
+                # Prepare row with all fields, handling missing ones
+                row = {
+                    'session_id': log_entry.get('session_id', ''),
+                    'username': log_entry.get('username', ''),
+                    'event_type': log_entry.get('event_type', ''),
+                    'message': log_entry.get('message', '')[:500],  # Limit message length
+                    'error': log_entry.get('error', '')[:500],  # Limit error length
+                    'traceback': log_entry.get('traceback', '')[:2000] if log_entry.get('traceback') else '',  # Limit traceback length
+                    'stage': log_entry.get('stage', ''),
+                    'timestamp': log_entry.get('timestamp', ''),
+                    'session_duration_ms': log_entry.get('session_duration_ms', ''),
+                    'success': log_entry.get('success', ''),
+                    'questions_count': log_entry.get('questions_count', ''),
+                    'handle_both_courses': log_entry.get('handle_both_courses', ''),
+                    'pages_closed': log_entry.get('pages_closed', ''),
+                }
+                writer.writerow(row)
+        
+        logging.info(f"✓ Session logs CSV report written to: {session_csv_filename}")
+        logging.info(f"  Total session log records: {len(SESSION_LOGS)}")
+        
+        # Count by event type
+        event_counts = {}
+        error_count = 0
+        for log_entry in SESSION_LOGS:
+            event_type = log_entry.get('event_type', 'UNKNOWN')
+            event_counts[event_type] = event_counts.get(event_type, 0) + 1
+            if event_type == 'ERROR':
+                error_count += 1
+        
+        logging.info(f"  Event type breakdown:")
+        for event_type, count in event_counts.items():
+            logging.info(f"    {event_type}: {count}")
+        logging.info(f"  Total errors: {error_count}")
+        
+    except Exception as e:
+        logging.error(f"✗ Error writing session logs CSV report: {e}")
+        import traceback
+        logging.error(traceback.format_exc())
 
 def write_csv_report():
     """Write collected metrics to CSV file."""
@@ -1287,6 +1876,9 @@ def write_csv_report():
         logging.error(f"✗ Error writing CSV report: {e}")
         import traceback
         logging.error(traceback.format_exc())
+    
+    # Write session logs CSV in parallel
+    write_session_logs_csv()
 
 async def stress_test(browser, users):
     """Run stress test where all sessions ask questions concurrently across multiple browser windows."""
@@ -1311,6 +1903,11 @@ async def stress_test(browser, users):
     # Calculate total questions
     total_questions = sum(len(user.get('questions', [])) for user in users)
     
+    # Get continuous mode configuration
+    continuous_mode = STRESS_TEST_CONFIG.get('continuous_mode', False)
+    continuous_iterations = STRESS_TEST_CONFIG.get('continuous_iterations', None)
+    continuous_cycle_delay = STRESS_TEST_CONFIG.get('continuous_cycle_delay', 5)
+    
     logging.info("=" * 80)
     logging.info("STRESS TEST STARTED - CONCURRENT MULTI-WINDOW MODE")
     logging.info(f"Users: {len(users)}")
@@ -1318,6 +1915,14 @@ async def stress_test(browser, users):
     logging.info(f"Total Concurrent Browser Windows: {total_concurrent_sessions}")
     logging.info(f"Total Questions Across All Users: {total_questions}")
     logging.info(f"Handle Both Courses: {handle_both_courses}")
+    logging.info(f"Continuous Mode: {continuous_mode}")
+    if continuous_mode:
+        if continuous_iterations:
+            logging.info(f"  → Will run {continuous_iterations} question cycles per session")
+        else:
+            logging.info(f"  → Will run infinite question cycles (until stopped)")
+        logging.info(f"  → Cycle delay: {continuous_cycle_delay}s between cycles")
+        logging.info(f"  → All conversations maintained concurrently")
     if handle_both_courses:
         logging.info(f"Architecture: Each browser window opens BOTH Course 1 and Course 2")
         logging.info(f"           → Questions distributed between courses automatically")
@@ -1363,10 +1968,17 @@ async def stress_test(browser, users):
     
     # Run all sessions concurrently (each opens its own browser window and asks all questions)
     logging.info(f"\nStarting {len(tasks)} concurrent sessions - all questions will be asked concurrently...")
+    if continuous_mode:
+        if continuous_iterations:
+            logging.info(f"Continuous mode: Each session will loop through questions {continuous_iterations} times")
+        else:
+            logging.info(f"Continuous mode: Each session will loop through questions indefinitely")
+        logging.info(f"All conversations will be maintained concurrently across all {total_concurrent_sessions} windows")
     if handle_both_courses:
         logging.info(f"Each browser window will open BOTH Course 1 and Course 2 tabs")
         logging.info(f"Questions will be distributed between courses and asked concurrently")
-    logging.info(f"Each session will ask all its questions sequentially within its own browser window")
+    if not continuous_mode:
+        logging.info(f"Each session will ask all its questions sequentially within its own browser window")
     results = await asyncio.gather(*tasks, return_exceptions=True)
     
     # Track results
