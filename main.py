@@ -8,11 +8,50 @@ from datetime import datetime
 import csv
 import os
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+# Configure logging - both console and file
+LOG_FILENAME = None  # Will be set on first log
+
+def setup_logging():
+    """Setup logging to both console and file."""
+    global LOG_FILENAME
+    
+    # Generate log filename with timestamp
+    if LOG_FILENAME is None:
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        LOG_FILENAME = f"stress_test_{timestamp}.log"
+    
+    # Create root logger
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    
+    # Remove existing handlers to avoid duplicates
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+    
+    # Create formatters
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    
+    # Console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+    
+    # File handler
+    try:
+        file_handler = logging.FileHandler(LOG_FILENAME, mode='a', encoding='utf-8')
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+        logging.info(f"📝 Logging to file: {LOG_FILENAME}")
+    except Exception as e:
+        logging.warning(f"Could not setup file logging: {e}")
+    
+    return LOG_FILENAME
+
+# Setup logging at startup
+LOG_FILENAME = setup_logging()
+logging.info(f"Logging initialized - Log file: {LOG_FILENAME}")
 
 # Global list to store CSV metrics
 CSV_METRICS = []
@@ -1768,6 +1807,9 @@ def write_session_logs_csv(append_mode=False):
     """
     global SESSION_CSV_EXPORT_FILENAME
     
+    # Get current working directory for absolute path
+    cwd = os.getcwd()
+    
     if not SESSION_LOGS:
         if not append_mode:
             logging.warning("No session logs collected to write to CSV")
@@ -1777,8 +1819,11 @@ def write_session_logs_csv(append_mode=False):
     if SESSION_CSV_EXPORT_FILENAME is None or not append_mode:
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         SESSION_CSV_EXPORT_FILENAME = f"session_logs_{timestamp}.csv"
+        logging.info(f"📊 Session logs CSV will be written to: {cwd}")
+        logging.info(f"   - Session logs: {SESSION_CSV_EXPORT_FILENAME}")
     
     session_csv_filename = SESSION_CSV_EXPORT_FILENAME
+    session_csv_filepath = os.path.join(cwd, session_csv_filename)
     
     # Define CSV columns for session logs
     fieldnames = [
@@ -1817,7 +1862,8 @@ def write_session_logs_csv(append_mode=False):
             mode = 'w'
             write_session_logs_csv._written_indices = set()
         
-        with open(session_csv_filename, mode, newline='', encoding='utf-8') as csvfile:
+        logging.info(f"📝 Writing session logs CSV to: {session_csv_filepath} (mode: {mode}, records: {len(entries_to_write)})")
+        with open(session_csv_filepath, mode, newline='', encoding='utf-8') as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames, extrasaction='ignore')
             
             # Write header only if creating new file
@@ -1848,11 +1894,18 @@ def write_session_logs_csv(append_mode=False):
                 writer.writerow(row)
         
         if append_mode:
-            logging.info(f"✓ Session logs CSV report updated (appended): {session_csv_filename}")
+            logging.info(f"✓ Session logs CSV report updated (appended): {session_csv_filepath}")
             logging.info(f"  Added {len(entries_to_write)} new log records (total: {len(SESSION_LOGS)})")
         else:
-            logging.info(f"✓ Session logs CSV report written to: {session_csv_filename}")
+            logging.info(f"✓ Session logs CSV report written successfully: {session_csv_filepath}")
+            logging.info(f"  Absolute path: {os.path.abspath(session_csv_filepath)}")
             logging.info(f"  Total session log records: {len(SESSION_LOGS)}")
+            # Verify file exists
+            if os.path.exists(session_csv_filepath):
+                file_size = os.path.getsize(session_csv_filepath)
+                logging.info(f"  File size: {file_size} bytes")
+            else:
+                logging.error(f"  ⚠️  WARNING: Session logs CSV file not found at {session_csv_filepath}")
         
         # Count by event type (only for full export)
         if not append_mode:
@@ -1882,6 +1935,9 @@ def write_csv_report(append_mode=False):
     """
     global CSV_EXPORT_FILENAME, ERRORS_CSV_EXPORT_FILENAME
     
+    # Get current working directory for absolute path
+    cwd = os.getcwd()
+    
     if not CSV_METRICS and not PAGE_ERRORS:
         if not append_mode:
             logging.warning("No metrics collected to write to CSV")
@@ -1892,8 +1948,12 @@ def write_csv_report(append_mode=False):
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         CSV_EXPORT_FILENAME = f"stress_test_results_{timestamp}.csv"
         ERRORS_CSV_EXPORT_FILENAME = f"stress_test_errors_{timestamp}.csv"
+        logging.info(f"📊 CSV files will be written to: {cwd}")
+        logging.info(f"   - Results: {CSV_EXPORT_FILENAME}")
+        logging.info(f"   - Errors: {ERRORS_CSV_EXPORT_FILENAME}")
     
     csv_filename = CSV_EXPORT_FILENAME
+    csv_filepath = os.path.join(cwd, csv_filename)
     
     # Define CSV columns
     fieldnames = [
@@ -1930,7 +1990,8 @@ def write_csv_report(append_mode=False):
             mode = 'w'
             write_csv_report._written_indices = set()
         
-        with open(csv_filename, mode, newline='', encoding='utf-8') as csvfile:
+        logging.info(f"📝 Writing CSV to: {csv_filepath} (mode: {mode}, records: {len(metrics_to_write)})")
+        with open(csv_filepath, mode, newline='', encoding='utf-8') as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             
             # Write header only if creating new file
@@ -1971,15 +2032,23 @@ def write_csv_report(append_mode=False):
                 writer.writerow(row)
         
         if append_mode:
-            logging.info(f"✓ CSV report updated (appended): {csv_filename}")
+            logging.info(f"✓ CSV report updated (appended): {csv_filepath}")
             logging.info(f"  Added {len(metrics_to_write)} new records (total: {len(CSV_METRICS)})")
         else:
-            logging.info(f"✓ CSV report written to: {csv_filename}")
+            logging.info(f"✓ CSV report written successfully: {csv_filepath}")
+            logging.info(f"  Absolute path: {os.path.abspath(csv_filepath)}")
             logging.info(f"  Total records: {len(CSV_METRICS)}")
+            # Verify file exists
+            if os.path.exists(csv_filepath):
+                file_size = os.path.getsize(csv_filepath)
+                logging.info(f"  File size: {file_size} bytes")
+            else:
+                logging.error(f"  ⚠️  WARNING: CSV file not found at {csv_filepath}")
         
         # Write errors CSV if there are any errors
         if PAGE_ERRORS:
             errors_csv_filename = ERRORS_CSV_EXPORT_FILENAME
+            errors_csv_filepath = os.path.join(cwd, errors_csv_filename)
             error_fieldnames = [
                 'type',
                 'message',
@@ -2010,7 +2079,8 @@ def write_csv_report(append_mode=False):
                     error_mode = 'w'
                     write_csv_report._error_written_indices = set()
                 
-                with open(errors_csv_filename, error_mode, newline='', encoding='utf-8') as errors_csvfile:
+                logging.info(f"📝 Writing errors CSV to: {errors_csv_filepath} (mode: {error_mode}, records: {len(errors_to_write)})")
+                with open(errors_csv_filepath, error_mode, newline='', encoding='utf-8') as errors_csvfile:
                     writer = csv.DictWriter(errors_csvfile, fieldnames=error_fieldnames)
                     
                     # Write header only if creating new file
@@ -2038,11 +2108,18 @@ def write_csv_report(append_mode=False):
                         writer.writerow(row)
                 
                 if append_mode:
-                    logging.info(f"✓ Errors CSV report updated (appended): {errors_csv_filename}")
+                    logging.info(f"✓ Errors CSV report updated (appended): {errors_csv_filepath}")
                     logging.info(f"  Added {len(errors_to_write)} new error records (total: {len(PAGE_ERRORS)})")
                 else:
-                    logging.info(f"✓ Errors CSV report written to: {errors_csv_filename}")
+                    logging.info(f"✓ Errors CSV report written successfully: {errors_csv_filepath}")
+                    logging.info(f"  Absolute path: {os.path.abspath(errors_csv_filepath)}")
                     logging.info(f"  Total error records: {len(PAGE_ERRORS)}")
+                    # Verify file exists
+                    if os.path.exists(errors_csv_filepath):
+                        file_size = os.path.getsize(errors_csv_filepath)
+                        logging.info(f"  File size: {file_size} bytes")
+                    else:
+                        logging.error(f"  ⚠️  WARNING: Errors CSV file not found at {errors_csv_filepath}")
             except Exception as e:
                 logging.error(f"✗ Error writing errors CSV report: {e}")
                 import traceback
@@ -2222,8 +2299,46 @@ async def stress_test(browser, users):
     logging.info(f"Total Stress Test Time: {total_stress_test_time:.2f}ms ({total_stress_test_time/1000:.2f}s)")
     logging.info("=" * 80)
     
-    # Write CSV report
+    # Write CSV reports
+    logging.info("\n" + "=" * 80)
+    logging.info("WRITING CSV REPORTS")
+    logging.info("=" * 80)
+    logging.info(f"Current working directory: {os.getcwd()}")
+    logging.info(f"Log file location: {os.path.abspath(LOG_FILENAME) if LOG_FILENAME else 'Not set'}")
+    
     write_csv_report()
+    write_session_logs_csv()
+    
+    logging.info("=" * 80)
+    logging.info("CSV REPORT GENERATION COMPLETE")
+    logging.info("=" * 80)
+    
+    # List all generated files
+    cwd = os.getcwd()
+    csv_files = [f for f in os.listdir(cwd) if f.endswith('.csv') and ('stress_test' in f or 'session_logs' in f)]
+    log_files = [f for f in os.listdir(cwd) if f.endswith('.log') and 'stress_test' in f]
+    
+    if csv_files:
+        logging.info(f"\n📁 Generated CSV files ({len(csv_files)}):")
+        for csv_file in sorted(csv_files):
+            file_path = os.path.join(cwd, csv_file)
+            if os.path.exists(file_path):
+                file_size = os.path.getsize(file_path)
+                logging.info(f"   ✓ {csv_file} ({file_size:,} bytes) - {os.path.abspath(file_path)}")
+            else:
+                logging.warning(f"   ✗ {csv_file} - FILE NOT FOUND")
+    else:
+        logging.warning("⚠️  No CSV files found in current directory!")
+    
+    if log_files:
+        logging.info(f"\n📁 Generated log files ({len(log_files)}):")
+        for log_file in sorted(log_files):
+            file_path = os.path.join(cwd, log_file)
+            if os.path.exists(file_path):
+                file_size = os.path.getsize(file_path)
+                logging.info(f"   ✓ {log_file} ({file_size:,} bytes) - {os.path.abspath(file_path)}")
+            else:
+                logging.warning(f"   ✗ {log_file} - FILE NOT FOUND")
 
 async def main():
     """Main function."""
