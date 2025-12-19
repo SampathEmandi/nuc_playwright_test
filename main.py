@@ -91,6 +91,9 @@ STRESS_TEST_CONFIG = {
     # CSV Export Configuration
     'incremental_csv_export': True,  # Write CSV logs periodically during execution (not just at end)
     'csv_export_interval': 300,  # Seconds between incremental CSV exports (default: 5 minutes)
+    # Network Monitoring Configuration
+    'enable_network_monitoring': True,  # Enable network monitoring for all users (WebSocket and API tracking)
+    'monitor_all_users': True,  # Monitor network traffic for all users (not just first 1-2)
     # Example: 5 users × 1 session = 5 concurrent browser windows, each handling one course
 }
 
@@ -302,6 +305,16 @@ async def open_course(context, course_number, tab_name, session_id=None, usernam
         # Setup error and console logging for course page
         setup_page_error_logging(page, tab_name, session_id=session_id, username=username)
         
+        # Setup network monitoring EARLY - before any navigation/network activity
+        # This ensures ALL users get monitoring, not just the first 1-2
+        websocket_requests, api_requests, websocket_timings = setup_network_monitoring(
+            page, tab_name, session_id=session_id, username=username
+        )
+        
+        # Verify monitoring is active
+        if STRESS_TEST_CONFIG.get('enable_network_monitoring', True) and STRESS_TEST_CONFIG.get('monitor_all_users', True):
+            logging.info(f"[{tab_name}] ✓ Network monitoring active for course page (user: {username or 'unknown'})")
+        
         # Check again before navigation
         if context.browser and not context.browser.is_connected():
             await page.close()
@@ -359,11 +372,39 @@ async def open_course(context, course_number, tab_name, session_id=None, usernam
         logging.error(f"✗ Error opening course {course_number} in {tab_name}: {e}")
         raise
 
-def setup_network_monitoring(page, tab_name):
-    """Setup network monitoring for WebSocket and API calls."""
+def setup_network_monitoring(page, tab_name, session_id=None, username=None):
+    """Setup network monitoring for WebSocket and API calls.
+    
+    Args:
+        page: Page object to monitor
+        tab_name: Name of the tab/course for logging
+        session_id: Optional session identifier for logging
+        username: Optional username for logging
+    """
+    # Check if network monitoring is enabled
+    if not STRESS_TEST_CONFIG.get('enable_network_monitoring', True):
+        logging.info(f"[{tab_name}] Network monitoring is disabled in configuration")
+        return [], [], {}
+    
+    # Check if we should monitor all users or just first few
+    monitor_all = STRESS_TEST_CONFIG.get('monitor_all_users', True)
+    if not monitor_all:
+        logging.warning(f"[{tab_name}] Network monitoring limited to first users (monitor_all_users=False)")
+        return [], [], {}
+    
     websocket_requests = []
     api_requests = []
     websocket_timings = {}
+    
+    # Create log prefix with session and user info
+    if session_id and username:
+        log_prefix = f"[{session_id}] [{username}] [{tab_name}]"
+    elif session_id:
+        log_prefix = f"[{session_id}] [{tab_name}]"
+    elif username:
+        log_prefix = f"[{username}] [{tab_name}]"
+    else:
+        log_prefix = f"[{tab_name}]"
     
     def handle_request(request):
         url = request.url
@@ -377,15 +418,15 @@ def setup_network_monitoring(page, tab_name):
                 'headers': dict(request.headers)
             })
             websocket_timings[url] = {'request_start': request_time}
-            logging.info(f"[{tab_name}] WebSocket Request: {url}")
-            logging.info(f"[{tab_name}]   Headers: {dict(request.headers)}")
+            logging.info(f"{log_prefix} [NETWORK] WebSocket Request: {url}")
+            logging.debug(f"{log_prefix} [NETWORK]   Headers: {dict(request.headers)}")
         elif 'nucaiapi' in url or 'nucapi' in url:
             api_requests.append({
                 'url': url,
                 'method': request.method,
                 'timestamp': request_time
             })
-            logging.info(f"[{tab_name}] API Request: {url} - Method: {request.method}")
+            logging.info(f"{log_prefix} [NETWORK] API Request: {url} - Method: {request.method}")
     
     def handle_response(response):
         url = response.url
@@ -395,38 +436,45 @@ def setup_network_monitoring(page, tab_name):
         # Log HTTP error responses (4xx, 5xx)
         if status >= 400:
             if status >= 500:
-                logging.error(f"[{tab_name}] [HTTP ERROR] {status} {url}")
+                logging.error(f"{log_prefix} [NETWORK] [HTTP ERROR] {status} {url}")
             elif status == 404:
-                logging.warning(f"[{tab_name}] [HTTP 404] Not Found: {url}")
+                logging.warning(f"{log_prefix} [NETWORK] [HTTP 404] Not Found: {url}")
             elif status == 403:
-                logging.warning(f"[{tab_name}] [HTTP 403] Forbidden: {url}")
+                logging.warning(f"{log_prefix} [NETWORK] [HTTP 403] Forbidden: {url}")
             elif status == 401:
-                logging.warning(f"[{tab_name}] [HTTP 401] Unauthorized: {url}")
+                logging.warning(f"{log_prefix} [NETWORK] [HTTP 401] Unauthorized: {url}")
             else:
-                logging.warning(f"[{tab_name}] [HTTP {status}] {url}")
+                logging.warning(f"{log_prefix} [NETWORK] [HTTP {status}] {url}")
         
         try:
             if 'chatbot_websocket' in url or 'websocket' in url.lower():
                 if url in websocket_timings:
                     websocket_timings[url]['response_time'] = response_time
                     connection_time = (response_time - websocket_timings[url]['request_start']) * 1000
-                    logging.info(f"[{tab_name}] WebSocket Connected: {url}")
-                    logging.info(f"[{tab_name}]   Connection Time: {connection_time:.2f}ms")
-                    logging.info(f"[{tab_name}]   Status: {response.status}")
+                    logging.info(f"{log_prefix} [NETWORK] WebSocket Connected: {url}")
+                    logging.info(f"{log_prefix} [NETWORK]   Connection Time: {connection_time:.2f}ms")
+                    logging.info(f"{log_prefix} [NETWORK]   Status: {response.status}")
             elif 'nucaiapi' in url or 'nucapi' in url:
                 timing = response.request.timing
                 response_time_ms = timing.get('responseEnd', 0) - timing.get('requestStart', 0)
-                logging.info(f"[{tab_name}] API Response: {url}")
-                logging.info(f"[{tab_name}]   Status: {response.status}")
-                logging.info(f"[{tab_name}]   Response Time: {response_time_ms:.2f}ms")
+                logging.info(f"{log_prefix} [NETWORK] API Response: {url}")
+                logging.info(f"{log_prefix} [NETWORK]   Status: {response.status}")
+                logging.info(f"{log_prefix} [NETWORK]   Response Time: {response_time_ms:.2f}ms")
                 if timing.get('responseStart', 0) > 0:
                     ttfb = timing.get('responseStart', 0) - timing.get('requestStart', 0)
-                    logging.info(f"[{tab_name}]   Time to First Byte (TTFB): {ttfb:.2f}ms")
+                    logging.info(f"{log_prefix} [NETWORK]   Time to First Byte (TTFB): {ttfb:.2f}ms")
         except Exception as e:
-            logging.debug(f"[{tab_name}] Error handling response: {e}")
+            logging.debug(f"{log_prefix} [NETWORK] Error handling response: {e}")
     
-    page.on('request', handle_request)
-    page.on('response', handle_response)
+    # Set up event listeners
+    try:
+        page.on('request', handle_request)
+        page.on('response', handle_response)
+        logging.info(f"{log_prefix} [NETWORK] Network monitoring enabled successfully")
+    except Exception as e:
+        logging.error(f"{log_prefix} [NETWORK] Failed to setup network monitoring: {e}")
+        import traceback
+        logging.error(traceback.format_exc())
     
     return websocket_requests, api_requests, websocket_timings
 
@@ -895,8 +943,15 @@ async def interact_with_chatbot(page, tab_name, questions=None, session_id=None,
         # Setup error and console logging
         setup_page_error_logging(page, tab_name, session_id=session_id, username=username)
         
-        # Setup network monitoring
-        websocket_requests, api_requests, websocket_timings = setup_network_monitoring(page, tab_name)
+        # Setup network monitoring - ensure it's set up BEFORE any network activity
+        # This ensures all users get monitoring, not just the first 1-2
+        websocket_requests, api_requests, websocket_timings = setup_network_monitoring(
+            page, tab_name, session_id=session_id, username=username
+        )
+        
+        # Verify monitoring is active
+        if STRESS_TEST_CONFIG.get('enable_network_monitoring', True) and STRESS_TEST_CONFIG.get('monitor_all_users', True):
+            logging.info(f"[{tab_name}] ✓ Network monitoring active for user: {username or 'unknown'}")
         
         # Wait for page to fully load
         await page.wait_for_load_state('domcontentloaded', timeout=30000)
@@ -2177,6 +2232,19 @@ async def stress_test(browser, users):
     logging.info(f"Total Questions Across All Users: {total_questions}")
     logging.info(f"Handle Both Courses: {handle_both_courses}")
     logging.info(f"Continuous Mode: {continuous_mode}")
+    
+    # Network Monitoring Configuration
+    enable_monitoring = STRESS_TEST_CONFIG.get('enable_network_monitoring', True)
+    monitor_all = STRESS_TEST_CONFIG.get('monitor_all_users', True)
+    logging.info(f"Network Monitoring: {'ENABLED' if enable_monitoring else 'DISABLED'}")
+    if enable_monitoring:
+        logging.info(f"  → Monitor All Users: {'YES' if monitor_all else 'NO (only first users)'}")
+        if monitor_all:
+            logging.info(f"  → ✓ All {len(users)} users will have network monitoring active")
+        else:
+            logging.warning(f"  → ⚠️  Only first users will be monitored (monitor_all_users=False)")
+    else:
+        logging.warning(f"  → ⚠️  Network monitoring is disabled (enable_network_monitoring=False)")
     if continuous_mode:
         if continuous_iterations:
             logging.info(f"  → Will run {continuous_iterations} question cycles per session")
