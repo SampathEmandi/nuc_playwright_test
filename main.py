@@ -8,9 +8,11 @@ from datetime import datetime
 import csv
 import os
 import json
+from concurrent.futures import ThreadPoolExecutor
+import threading
 
-# Debug logging path is determined dynamically relative to the script's location, inside a 'common' folder
-DEBUG_LOG_PATH = str(Path(__file__).parent / "common" / "debug.log")
+# Debug logging path is determined dynamically relative to the script's location, inside a '.cursor' folder
+DEBUG_LOG_PATH = str(Path(__file__).parent / ".cursor" / "debug.log")
 
 def debug_log(hypothesis_id, location, message, data=None, session_id=None, run_id="initial"):
     """Write debug log entry in NDJSON format."""
@@ -96,16 +98,22 @@ CSV_EXPORT_FILENAME = None
 SESSION_CSV_EXPORT_FILENAME = None
 ERRORS_CSV_EXPORT_FILENAME = None
 
+# Thread pool executor for CPU-bound or blocking operations
+THREAD_POOL = ThreadPoolExecutor(max_workers=20, thread_name_prefix="playwright_worker")
+
+# Lock for thread-safe operations
+CSV_LOCK = threading.Lock()
+
 # ============================================================================
 # STRESS TEST CONFIGURATION
 # ============================================================================
 STRESS_TEST_CONFIG = {
     'enabled': True,  # Set to False for normal single session mode
-    'sessions_per_user': 10,  # Number of concurrent browser windows per user (each user logs in multiple times)
+    'sessions_per_user': 1,  # Number of concurrent browser windows per user (each user logs in multiple times)
     'delay_between_questions': 3,  # Seconds to wait between questions within a session
     'handle_both_courses': True,  # Set to False to open only one course per session
-    'course_for_questions': 1,  # Which course to open (1 or 2) - only used if handle_both_courses is False
-    'max_concurrent_contexts': 100,  # Maximum number of concurrent browser contexts (windows) across all users - Increased for heavy load testing
+    # 'course_for_questions': 1,  # Which course to open (1 or 2) - only used if handle_both_courses is False
+    'max_concurrent_contexts': 10000,  # Maximum number of concurrent browser contexts (windows) across all users - Set very high to effectively remove limit
     # WebSocket Stress Configuration
     'websocket_stress_mode': False,  # Enable aggressive WebSocket stress testing
     'websocket_rapid_fire': False,  # Send questions as fast as possible (minimal delays)
@@ -122,7 +130,7 @@ STRESS_TEST_CONFIG = {
     # Network Monitoring Configuration
     'enable_network_monitoring': True,  # Enable network monitoring for all users (WebSocket and API tracking)
     'monitor_all_users': True,  # Monitor network traffic for all users (not just first 1-2)
-    # Example: 5 users × 1 session = 5 concurrent browser windows, each handling one course
+    # Example: 5 users × 10 sessions = 50 concurrent browser windows, each handling one course
 }
 
 # ============================================================================
@@ -182,7 +190,14 @@ QUESTION_CONFIG = {
 # USER CREDENTIALS AND QUESTIONS - Each user has their own list of questions
 # ============================================================================
 USERS = [
+
     {
+        'username': 'ctalluri@bay6.ai',
+        'password': 'devBay62025##',
+        # All course 1 questions go to course 1, all course 2 to course 2, general to both
+        'questions': course_1_questions + course_2_questions + general_questions,
+    },
+        {
         'username': 'babug@bay6.ai',
         'password': 'devBay62025##',
         # All course 1 questions go to course 1, all course 2 to course 2, general to both
@@ -194,13 +209,7 @@ USERS = [
         # All course 1 questions go to course 1, all course 2 to course 2, general to both
         'questions': course_1_questions + course_2_questions + general_questions,
     },
-    {
-        'username': 'ctalluri@bay6.ai',
-        'password': 'devBay62025##',
-        # All course 1 questions go to course 1, all course 2 to course 2, general to both
-        'questions': course_1_questions + course_2_questions + general_questions,
-    },
-    {
+        {
         'username': 'samuelp@bay6.ai',
         'password': 'devBay62025##',
         # All course 1 questions go to course 1, all course 2 to course 2, general to both
@@ -212,6 +221,7 @@ USERS = [
         # All course 1 questions go to course 1, all course 2 to course 2, general to both
         'questions': course_1_questions + course_2_questions + general_questions,
     },
+
 ]
 
 # ============================================================================
@@ -260,6 +270,93 @@ def select_questions_for_course(course_questions, general_questions, num_questio
     selected = random.sample(pool, num_to_select)
     random.shuffle(selected)
     return selected
+
+async def run_concurrent_with_timeout(coroutines, timeout=None, return_exceptions=True):
+    """Run multiple coroutines concurrently with optional timeout.
+    
+    This ensures all operations run in parallel without blocking each other.
+    Uses asyncio.create_task to ensure true parallelism.
+    
+    Args:
+        coroutines: List of coroutines to run
+        timeout: Optional timeout in seconds
+        return_exceptions: If True, exceptions are returned as results
+    
+    Returns:
+        List of results
+    """
+    # Create tasks immediately to ensure they start running in parallel
+    tasks = [asyncio.create_task(coro) for coro in coroutines]
+    
+    if timeout:
+        try:
+            results = await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=return_exceptions),
+                timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            # Cancel all tasks on timeout
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            raise
+    else:
+        results = await asyncio.gather(*tasks, return_exceptions=return_exceptions)
+    
+    return results
+
+async def handle_csrf_token_error(page, tab_name, session_id=None, username=None, iframe=None, max_refresh_attempts=3):
+    """Check for CSRF token errors and refresh the page if detected.
+    
+    Args:
+        page: Page object
+        tab_name: Name of the tab/course
+        session_id: Session identifier for logging
+        username: Username for logging
+        iframe: Optional iframe to check for CSRF errors
+        max_refresh_attempts: Maximum number of refresh attempts
+    
+    Returns:
+        bool: True if CSRF error was detected and page was refreshed, False otherwise
+    """
+    try:
+        log_prefix = f"[{session_id}] [{username}] [{tab_name}]" if session_id and username else f"[{tab_name}]"
+        csrf_detected = False
+        
+        # Check for CSRF token error in page content
+        try:
+            page_content = await page.content()
+            if "Invalid custom CSRF token" in page_content or ("CSRF token" in page_content and "Invalid" in page_content):
+                csrf_detected = True
+                logging.warning(f"{log_prefix} CSRF token error detected in page content")
+        except:
+            pass
+        
+        # Check for CSRF token error in iframe content if provided
+        if iframe and not csrf_detected:
+            try:
+                iframe_content = await iframe.content()
+                if "Invalid custom CSRF token" in iframe_content or ("CSRF token" in iframe_content and "Invalid" in iframe_content):
+                    csrf_detected = True
+                    logging.warning(f"{log_prefix} CSRF token error detected in iframe content")
+            except:
+                pass
+        
+        if csrf_detected:
+            logging.warning(f"{log_prefix} CSRF token error detected, refreshing page...")
+            
+            try:
+                await page.reload(wait_until='domcontentloaded', timeout=30000)
+                await asyncio.sleep(2)  # Wait for page to stabilize
+                logging.info(f"{log_prefix} Page refreshed successfully after CSRF token error")
+                return True
+            except Exception as refresh_error:
+                logging.error(f"{log_prefix} Failed to refresh page after CSRF error: {refresh_error}")
+                return False
+    except Exception as e:
+        # Silently fail - this is a check, not critical
+        pass
+    return False
 
 def distribute_questions_by_course(user_questions, course_1_questions, course_2_questions, general_questions):
     """Distribute user questions between Course 1 and Course 2 based on question type.
@@ -385,52 +482,212 @@ async def open_course(context, course_number, tab_name, session_id=None, usernam
             raise Exception(f"Browser disconnected before navigation to course {course_number} (after retries)")
         
         # Navigate to dashboard
-        await page.goto('https://development.instructure.com', wait_until='domcontentloaded', timeout=60000)
+        logging.info(f"[{tab_name}] Navigating to dashboard...")
+        try:
+            await page.goto('https://development.instructure.com', wait_until='domcontentloaded', timeout=60000)
+            logging.info(f"[{tab_name}] Dashboard navigation completed")
+        except Exception as nav_error:
+            error_str = str(nav_error)
+            if "Target page, context or browser has been closed" in error_str or "context or browser has been closed" in error_str:
+                logging.error(f"[{tab_name}] Page/context closed during navigation: {nav_error}")
+                raise Exception(f"Page/context closed during navigation: {nav_error}")
+            raise
+        
+        # Check for CSRF token error and refresh if needed
+        csrf_refreshed = await handle_csrf_token_error(page, tab_name, session_id=session_id, username=username, iframe=None)
+        if csrf_refreshed:
+            # Wait for page to stabilize after refresh
+            await page.wait_for_load_state('domcontentloaded', timeout=30000)
+            await asyncio.sleep(1)
+            logging.info(f"[{tab_name}] Page refreshed due to CSRF token error")
         
         # Wait for dashboard container to be attached
-        await page.locator('#DashboardCard_Container').wait_for(state='attached', timeout=30000)
+        logging.info(f"[{tab_name}] Waiting for dashboard container...")
+        try:
+            await page.locator('#DashboardCard_Container').wait_for(state='attached', timeout=30000)
+            logging.info(f"[{tab_name}] Dashboard container found")
+        except Exception as container_error:
+            logging.error(f"[{tab_name}] Dashboard container not found: {container_error}")
+            # Try to check current URL
+            try:
+                current_url = page.url
+                logging.info(f"[{tab_name}] Current URL: {current_url}")
+            except:
+                pass
+            raise
         
-        # Wait for both course cards to be visible before clicking (with retry and refresh)
-        logging.info(f"[{tab_name}] Waiting for Course 1 and Course 2 cards to be visible...")
-        course_1_card = page.locator('#DashboardCard_Container > div > div:nth-child(1) > div > div:nth-child(1) > div > a > div')
-        course_2_card = page.locator('#DashboardCard_Container > div > div:nth-child(1) > div > div:nth-child(2) > div > a > div')
+        # Try multiple selector strategies
+        course_1_selectors = [
+            '#DashboardCard_Container > div > div > div:nth-child(1) > div > a',
+            '#DashboardCard_Container > div > div > div:nth-child(1) > div > a > div',
+            '#DashboardCard_Container div:nth-child(1) > div > a',
+            'a[href*="/courses/"]:nth-of-type(1)'
+        ]
+        course_2_selectors = [
+            '#DashboardCard_Container > div > div > div:nth-child(2) > div > a',
+            '#DashboardCard_Container > div > div > div:nth-child(2) > div > a > div',
+            '#DashboardCard_Container div:nth-child(2) > div > a',
+            'a[href*="/courses/"]:nth-of-type(2)'
+        ]
         
         # Try to wait for cards with retry logic
         cards_visible = False
-        for attempt in range(3):
+        course_1_card = None
+        course_2_card = None
+        
+        for attempt in range(5):  # Increased attempts
             try:
-                # Wait for both cards with longer timeout
-                await course_1_card.wait_for(state='visible', timeout=45000)
-                await course_2_card.wait_for(state='visible', timeout=45000)
-                cards_visible = True
-                logging.info(f"[{tab_name}] Both course cards visible on attempt {attempt + 1}")
-                break
+                # Try different selectors
+                for selector_idx, (sel1, sel2) in enumerate(zip(course_1_selectors, course_2_selectors)):
+                    try:
+                        course_1_card = page.locator(sel1)
+                        course_2_card = page.locator(sel2)
+                        
+                        # Wait for both cards with shorter timeout per attempt
+                        await course_1_card.wait_for(state='visible', timeout=15000)
+                        await course_2_card.wait_for(state='visible', timeout=15000)
+                        cards_visible = True
+                        logging.info(f"[{tab_name}] Both course cards visible on attempt {attempt + 1} with selector {selector_idx + 1}")
+                        break
+                    except Exception as selector_error:
+                        if selector_idx < len(course_1_selectors) - 1:
+                            logging.debug(f"[{tab_name}] Selector {selector_idx + 1} failed, trying next: {selector_error}")
+                            continue
+                        else:
+                            raise selector_error
+                
+                if cards_visible:
+                    break
+                    
             except Exception as e:
                 logging.warning(f"[{tab_name}] Course cards not visible on attempt {attempt + 1}: {e}")
-                if attempt < 2:
+                
+                # Check if page is still valid
+                page_valid = True
+                try:
+                    page_valid = not page.is_closed()
+                except Exception:
+                    page_valid = False
+                
+                if not page_valid:
+                    error_msg = "Page is closed - cannot proceed"
+                    logging.error(f"[{tab_name}] {error_msg}")
+                    raise Exception(error_msg)
+                
+                if attempt < 4:  # Don't reload on last attempt
                     # Refresh page and retry
-                    logging.info(f"[{tab_name}] Refreshing page and retrying...")
-                    await page.reload(wait_until='domcontentloaded', timeout=30000)
-                    await asyncio.sleep(2)
-                    # Re-wait for dashboard container
-                    await page.locator('#DashboardCard_Container').wait_for(state='attached', timeout=30000)
-                else:
-                    # Last attempt - try to proceed anyway if at least dashboard is visible
-                    logging.warning(f"[{tab_name}] Could not wait for both cards, proceeding with available course...")
+                    logging.info(f"[{tab_name}] Refreshing page and retrying (attempt {attempt + 1}/5)...")
                     try:
-                        # Check if at least the target course card exists
-                        target_card = page.locator(f'#DashboardCard_Container > div > div:nth-child(1) > div > div:nth-child({course_number}) > div > a > div')
-                        await target_card.wait_for(state='visible', timeout=10000)
-                        cards_visible = True
-                    except:
-                        pass  # Will try to click anyway
+                        await page.reload(wait_until='domcontentloaded', timeout=30000)
+                        await asyncio.sleep(2)
+                        # Re-wait for dashboard container
+                        await page.locator('#DashboardCard_Container').wait_for(state='attached', timeout=30000)
+                    except Exception as reload_error:
+                        error_str = str(reload_error)
+                        if "Target page, context or browser has been closed" in error_str or "context or browser has been closed" in error_str:
+                            logging.error(f"[{tab_name}] Page/context closed during reload: {reload_error}")
+                            raise Exception(f"Page/context closed during reload: {reload_error}")
+                        raise
+                else:
+                    # Last attempt - try to proceed with target course only
+                    logging.warning(f"[{tab_name}] Could not wait for both cards after 5 attempts, trying target course only...")
+                    try:
+                        # Try all selectors for target course
+                        target_selectors = course_1_selectors if course_number == 1 else course_2_selectors
+                        for selector in target_selectors:
+                            try:
+                                target_card = page.locator(selector)
+                                await target_card.wait_for(state='visible', timeout=10000)
+                                cards_visible = True
+                                logging.info(f"[{tab_name}] Target course card found with fallback selector")
+                                break
+                            except:
+                                continue
+                    except Exception as fallback_error:
+                        logging.warning(f"[{tab_name}] Fallback also failed: {fallback_error}")
+                        # Will try to click anyway
+                    await asyncio.sleep(2)
+        # Check if page is still valid before clicking
+        page_valid = True
+        try:
+            page_valid = not page.is_closed()
+        except Exception:
+            # If checking is_closed() throws an error, assume page is invalid
+            page_valid = False
         
-        # Simple click on course link - Playwright handles waiting automatically
-        course_locator = page.locator(f'#DashboardCard_Container > div > div:nth-child(1) > div > div:nth-child({course_number}) > div > a')
-        await course_locator.click(timeout=30000)
-        # Wait for navigation after click
-        await page.wait_for_load_state('domcontentloaded', timeout=30000)
-        logging.info(f"✓ Course {course_number} opened in {tab_name}")
+        if not page_valid:
+            error_msg = "Page is closed - cannot click course link"
+            logging.error(f"[{tab_name}] {error_msg}")
+            raise Exception(error_msg)
+        
+        # Wait a bit for page to fully load
+        await asyncio.sleep(1)
+        
+        # Try multiple selectors for clicking the course link
+        course_link_selectors = [
+            f'#DashboardCard_Container > div > div > div:nth-child({course_number}) > div > a',
+            f'#DashboardCard_Container > div > div > div:nth-child({course_number}) > div > a > div',
+            f'#DashboardCard_Container div:nth-child({course_number}) > div > a',
+            f'a[href*="/courses/"]:nth-of-type({course_number})',
+            f'#DashboardCard_Container a[href*="/courses/"]:nth-child({course_number})',
+            f'#DashboardCard_Container a[href*="/courses/"]',  # Fallback: any course link
+        ]
+        
+        clicked = False
+        last_error = None
+        for selector in course_link_selectors:
+            try:
+                course_locator = page.locator(selector)
+                # Count how many elements match
+                count = await course_locator.count()
+                logging.info(f"[{tab_name}] Selector '{selector[:60]}...' found {count} element(s)")
+                
+                if count == 0:
+                    logging.debug(f"[{tab_name}] Selector found no elements, trying next...")
+                    continue
+                
+                # If multiple links found and we want a specific course, try to get the right one
+                if count > 1 and course_number <= count:
+                    course_locator = course_locator.nth(course_number - 1)
+                
+                # Wait for it to be visible and enabled
+                await course_locator.wait_for(state='visible', timeout=15000)
+                logging.info(f"[{tab_name}] Course link is visible, clicking...")
+                await course_locator.click(timeout=30000)
+                # Wait for navigation after click
+                await page.wait_for_load_state('domcontentloaded', timeout=30000)
+                logging.info(f"✓ Course {course_number} opened in {tab_name} using selector: {selector[:50]}...")
+                clicked = True
+                break
+            except Exception as click_error:
+                error_str = str(click_error)
+                if "Target page, context or browser has been closed" in error_str or "context or browser has been closed" in error_str:
+                    logging.error(f"✗ Page/context closed during course click: {click_error}")
+                    raise Exception(f"Page/context closed during course click: {click_error}")
+                last_error = click_error
+                # Try next selector
+                logging.warning(f"[{tab_name}] Selector failed: {selector[:50]}... - {click_error}")
+                continue
+        
+        if not clicked:
+            # Last resort: try to find any course link and click it
+            logging.warning(f"[{tab_name}] All specific selectors failed, trying to find any course link...")
+            try:
+                all_course_links = page.locator('#DashboardCard_Container a[href*="/courses/"]')
+                count = await all_course_links.count()
+                if count > 0:
+                    target_link = all_course_links.nth(course_number - 1) if course_number <= count else all_course_links.first
+                    await target_link.wait_for(state='visible', timeout=10000)
+                    await target_link.click(timeout=30000)
+                    await page.wait_for_load_state('domcontentloaded', timeout=30000)
+                    logging.info(f"✓ Course {course_number} opened in {tab_name} using fallback selector")
+                    clicked = True
+            except Exception as fallback_error:
+                logging.error(f"[{tab_name}] Fallback also failed: {fallback_error}")
+        
+        if not clicked:
+            raise Exception(f"Failed to click course {course_number} link with all selectors. Last error: {last_error}")
+        
         return page
     except Exception as e:
         logging.error(f"✗ Error opening course {course_number} in {tab_name}: {e}")
@@ -576,6 +833,11 @@ def setup_page_error_logging(page, tab_name, session_id=None, username=None):
                     logging.error(f"{log_prefix}   Args: {args_text}")
                 except:
                     pass
+            
+            # Check for CSRF token error - log it (refresh will be handled before critical operations)
+            if "Invalid custom CSRF token" in msg_text or "CSRF token" in msg_text:
+                logging.warning(f"{log_prefix} CSRF token error detected in console - will refresh on next operation")
+            
             # Store in PAGE_ERRORS for CSV
             PAGE_ERRORS.append({
                 'type': 'CONSOLE_ERROR',
@@ -612,6 +874,16 @@ def setup_page_error_logging(page, tab_name, session_id=None, username=None):
         logging.error(f"{log_prefix} [PAGE ERROR] {error_message}")
         if error_stack:
             logging.error(f"{log_prefix}   Stack: {error_stack}")
+        
+        # Check for CSRF token error and refresh page
+        if "Invalid custom CSRF token" in error_message or "CSRF token" in error_message:
+            logging.warning(f"{log_prefix} CSRF token error detected in page error, refreshing page...")
+            try:
+                asyncio.create_task(page.reload(wait_until='domcontentloaded', timeout=30000))
+                asyncio.create_task(asyncio.sleep(2))  # Wait for page to stabilize
+            except Exception as refresh_error:
+                logging.error(f"{log_prefix} Failed to refresh page after CSRF error: {refresh_error}")
+        
         # Store in PAGE_ERRORS for CSV
         PAGE_ERRORS.append({
             'type': 'PAGE_ERROR',
@@ -776,6 +1048,13 @@ async def ask_single_question(page, iframe, tab_name, question, question_num, se
     try:
         logging.info(f"[{tab_name}] ========== Question {question_num} (Concurrent) ==========")
         
+        # Check for CSRF token error and refresh if needed before getting iframe
+        csrf_refreshed = await handle_csrf_token_error(page, tab_name, session_id=session_id, username=username, iframe=None)
+        if csrf_refreshed:
+            # Wait for page to stabilize after refresh
+            await page.wait_for_load_state('domcontentloaded', timeout=30000)
+            await asyncio.sleep(1)
+        
         # Re-acquire iframe for each question in case it changed
         try:
             iframe = await get_iframe_content_frame(page, tab_name)
@@ -871,7 +1150,7 @@ async def ask_single_question(page, iframe, tab_name, question, question_num, se
                         raise Exception(f"Question box not usable: visible={is_visible}, enabled={is_enabled}")
                 
                 # #region agent log
-                debug_log("QUESTION_CLICK", f"ask_single_question:{851}", "Question box click attempt", {
+                debug_log("QUESTION_CLICK", f"ask_single_question:{874}", "Question box click attempt", {
                     "session_id": session_id,
                     "username": username,
                     "tab_name": tab_name,
@@ -885,7 +1164,7 @@ async def ask_single_question(page, iframe, tab_name, question, question_num, se
                 question_box_click_success = True
                 
                 # #region agent log
-                debug_log("QUESTION_CLICK", f"ask_single_question:{853}", "Question box click successful", {
+                debug_log("QUESTION_CLICK", f"ask_single_question:{888}", "Question box click successful", {
                     "session_id": session_id,
                     "username": username,
                     "tab_name": tab_name,
@@ -899,7 +1178,7 @@ async def ask_single_question(page, iframe, tab_name, question, question_num, se
                 logging.debug(f"[{tab_name}] Question box click attempt {question_click_attempt} failed: {e}")
                 
                 # #region agent log
-                debug_log("QUESTION_CLICK", f"ask_single_question:{870}", "Question box click failed", {
+                debug_log("QUESTION_CLICK", f"ask_single_question:{902}", "Question box click failed", {
                     "session_id": session_id,
                     "username": username,
                     "tab_name": tab_name,
@@ -1145,6 +1424,17 @@ async def interact_with_chatbot(page, tab_name, questions=None, session_id=None,
                     }, session_id=session_id)
                     # #endregion
                     
+                    # Check for CSRF token error after clicking chatbot button and refresh if needed
+                    csrf_refreshed = await handle_csrf_token_error(page, tab_name, session_id=session_id, username=username)
+                    if csrf_refreshed:
+                        logging.info(f"[{tab_name}] Page refreshed due to CSRF token error, waiting for page to stabilize...")
+                        await page.wait_for_load_state('domcontentloaded', timeout=30000)
+                        await asyncio.sleep(2)
+                        # Re-click chatbot button after refresh
+                        await chatbot_btn.wait_for(state='visible', timeout=30000)
+                        await chatbot_btn.click(timeout=10000)
+                        await asyncio.sleep(0.5)  # Brief wait for iframe to appear
+                    
                     break
                 except:
                     # Iframe didn't appear, click may have failed
@@ -1235,6 +1525,28 @@ async def interact_with_chatbot(page, tab_name, questions=None, session_id=None,
                             "click_time_ms": auth_time
                         }, session_id=session_id)
                         # #endregion
+                        
+                        # Check for CSRF token error after clicking authorize button and refresh if needed
+                        # Get iframe to check for CSRF errors inside it
+                        try:
+                            iframe_for_csrf = await get_iframe_content_frame(page, tab_name)
+                        except:
+                            iframe_for_csrf = iframe  # Use existing iframe if available
+                        
+                        csrf_refreshed = await handle_csrf_token_error(page, tab_name, session_id=session_id, username=username, iframe=iframe_for_csrf)
+                        if csrf_refreshed:
+                            logging.info(f"[{tab_name}] Page refreshed due to CSRF token error after authorize, waiting for page to stabilize...")
+                            await page.wait_for_load_state('domcontentloaded', timeout=30000)
+                            await asyncio.sleep(2)
+                            # Need to re-click chatbot and authorize buttons after refresh
+                            await chatbot_btn.wait_for(state='visible', timeout=30000)
+                            await chatbot_btn.click(timeout=10000)
+                            await asyncio.sleep(0.5)
+                            iframe = await get_iframe_content_frame(page, tab_name)
+                            authorize_btn = iframe.get_by_role('button', name='Authorize')
+                            await authorize_btn.wait_for(state='visible', timeout=30000)
+                            await authorize_btn.click(timeout=10000)
+                            await asyncio.sleep(0.5)
                         
                         break
                     else:
@@ -1481,12 +1793,25 @@ async def run_user_session(context, user, questions=None, handle_both_courses=Tr
     username = user['username']
     password = user['password']
     
+    # Extract user index from session_id for tracking
+    user_index_from_session = None
+    try:
+        if session_id and session_id.startswith("User"):
+            parts = session_id.split("_")
+            if len(parts) > 0:
+                user_part = parts[0]  # "User1", "User2", etc.
+                user_index_from_session = int(user_part.replace("User", "")) - 1  # Convert to 0-based
+    except:
+        pass
+    
     # #region agent log
-    debug_log("H4", f"run_user_session:{1220}", "User session function entry", {
+    debug_log("H4", f"run_user_session:{1471}", "User session function entry - H4: Browser disconnection", {
         "session_id": session_id,
         "username": username,
         "handle_both_courses": handle_both_courses,
-        "questions_count": len(questions) if questions else 0
+        "questions_count": len(questions) if questions else 0,
+        "user_index": user_index_from_session,
+        "browser_connected": context.browser.is_connected() if context and context.browser else False
     }, session_id=session_id)
     # #endregion
     
@@ -1647,10 +1972,11 @@ async def run_user_session(context, user, questions=None, handle_both_courses=Tr
                     login_successful = True
                     
                     # #region agent log
-                    debug_log("LOGIN_RETRY", f"run_user_session:{1402}", "Login successful", {
+                    debug_log("H3", f"run_user_session:{1649}", "Login successful - H3: Login failures", {
                         "session_id": session_id,
                         "username": username,
-                        "attempt": login_attempt
+                        "attempt": login_attempt,
+                        "user_index": user_index_from_session if 'user_index_from_session' in locals() else None
                     }, session_id=session_id)
                     # #endregion
                     
@@ -1804,8 +2130,8 @@ async def run_user_session(context, user, questions=None, handle_both_courses=Tr
         
         # Wait for both course cards to be visible with retry logic
         logging.info(f"{log_prefix} Waiting for Course 1 and Course 2 cards to be visible...")
-        course_1_card = login_page.locator('#DashboardCard_Container > div > div:nth-child(1) > div > div:nth-child(1) > div > a > div')
-        course_2_card = login_page.locator('#DashboardCard_Container > div > div:nth-child(1) > div > div:nth-child(2) > div > a > div')
+        course_1_card = login_page.locator('#DashboardCard_Container > div > div > div:nth-child(1) > div > a')
+        course_2_card = login_page.locator('#DashboardCard_Container > div > div > div:nth-child(2) > div > a')
         
         cards_visible = False
         for attempt in range(3):
@@ -1901,11 +2227,107 @@ async def run_user_session(context, user, questions=None, handle_both_courses=Tr
             
             # Open both courses in parallel (one login, multiple courses)
             logging.info(f"{log_prefix} Opening Course 1 and Course 2 in parallel...")
-            course_1_page, course_2_page = await asyncio.gather(
-                open_course(context, 1, f"Course 1", session_id=session_id, username=username),
-                open_course(context, 2, f"Course 2", session_id=session_id, username=username),
-                return_exceptions=False
-            )
+            
+            try:
+                # Create tasks immediately to ensure true parallelism
+                course_1_task = asyncio.create_task(open_course(context, 1, f"Course 1", session_id=session_id, username=username))
+                course_2_task = asyncio.create_task(open_course(context, 2, f"Course 2", session_id=session_id, username=username))
+                
+                # Wait for both with exception handling
+                results = await asyncio.gather(course_1_task, course_2_task, return_exceptions=True)
+                
+                # Check for exceptions and handle closed page/context errors
+                course_1_page = None
+                course_2_page = None
+                course_1_error = None
+                course_2_error = None
+                
+                if isinstance(results[0], Exception):
+                    course_1_error = results[0]
+                    error_msg = str(course_1_error)
+                    if "Target page, context or browser has been closed" in error_msg or "context or browser has been closed" in error_msg:
+                        logging.warning(f"{log_prefix} Course 1 opening failed due to closed context - attempting recovery...")
+                        # Try to recover by checking context and retrying
+                        if context and not context.pages:
+                            logging.error(f"{log_prefix} Context has no pages - cannot recover")
+                        else:
+                            # Retry once
+                            try:
+                                course_1_page = await open_course(context, 1, f"Course 1", session_id=session_id, username=username)
+                                logging.info(f"{log_prefix} Course 1 recovery successful")
+                            except Exception as retry_error:
+                                logging.error(f"{log_prefix} Course 1 recovery failed: {retry_error}")
+                                course_1_error = retry_error
+                    else:
+                        logging.error(f"{log_prefix} Course 1 opening failed: {course_1_error}")
+                else:
+                    course_1_page = results[0]
+                
+                if isinstance(results[1], Exception):
+                    course_2_error = results[1]
+                    error_msg = str(course_2_error)
+                    if "Target page, context or browser has been closed" in error_msg or "context or browser has been closed" in error_msg:
+                        logging.warning(f"{log_prefix} Course 2 opening failed due to closed context - attempting recovery...")
+                        # Try to recover by checking context and retrying
+                        if context and not context.pages:
+                            logging.error(f"{log_prefix} Context has no pages - cannot recover")
+                        else:
+                            # Retry once
+                            try:
+                                course_2_page = await open_course(context, 2, f"Course 2", session_id=session_id, username=username)
+                                logging.info(f"{log_prefix} Course 2 recovery successful")
+                            except Exception as retry_error:
+                                logging.error(f"{log_prefix} Course 2 recovery failed: {retry_error}")
+                                course_2_error = retry_error
+                    else:
+                        logging.error(f"{log_prefix} Course 2 opening failed: {course_2_error}")
+                else:
+                    course_2_page = results[1]
+                
+                # If both failed, raise an error
+                if course_1_error and course_2_error:
+                    error_msg = f"Both courses failed to open. Course 1: {course_1_error}, Course 2: {course_2_error}"
+                    # #region agent log
+                    debug_log("H5", f"run_user_session:{1923}", "Course opening failed - H5: Resource exhaustion", {
+                        "session_id": session_id,
+                        "username": username,
+                        "user_index": user_index_from_session if 'user_index_from_session' in locals() else None,
+                        "error": error_msg,
+                        "browser_connected": context.browser.is_connected() if context and context.browser else False
+                    }, session_id=session_id)
+                    # #endregion
+                    raise Exception(error_msg)
+                
+                # If only one failed, log warning but continue with the successful one
+                if course_1_error:
+                    logging.warning(f"{log_prefix} Course 1 failed but continuing with Course 2: {course_1_error}")
+                if course_2_error:
+                    logging.warning(f"{log_prefix} Course 2 failed but continuing with Course 1: {course_2_error}")
+                
+                # #region agent log
+                debug_log("H5", f"run_user_session:{1923}", "Courses opened (with recovery) - H5: Resource exhaustion", {
+                    "session_id": session_id,
+                    "username": username,
+                    "user_index": user_index_from_session if 'user_index_from_session' in locals() else None,
+                    "course_1_page_exists": course_1_page is not None,
+                    "course_2_page_exists": course_2_page is not None,
+                    "course_1_error": str(course_1_error) if course_1_error else None,
+                    "course_2_error": str(course_2_error) if course_2_error else None,
+                    "browser_connected": context.browser.is_connected() if context and context.browser else False
+                }, session_id=session_id)
+                # #endregion
+            except Exception as course_open_error:
+                # #region agent log
+                debug_log("H5", f"run_user_session:{1923}", "Course opening failed - H5: Resource exhaustion", {
+                    "session_id": session_id,
+                    "username": username,
+                    "user_index": user_index_from_session if 'user_index_from_session' in locals() else None,
+                    "error": str(course_open_error),
+                    "browser_connected": context.browser.is_connected() if context and context.browser else False
+                }, session_id=session_id)
+                # #endregion
+                raise
+            
             course_open_end_time = time.time()
             course_open_time_ms = (course_open_end_time - course_open_start_time) * 1000 if course_open_start_time else 0
             log_session_event(
@@ -1936,6 +2358,19 @@ async def run_user_session(context, user, questions=None, handle_both_courses=Tr
             
             if chatbot_tasks:
                 logging.info(f"{log_prefix} Starting concurrent chatbot interactions for both courses...")
+                
+                # #region agent log
+                debug_log("H5", f"run_user_session:{1952}", "Conversation start - H5: Resource exhaustion", {
+                    "session_id": session_id,
+                    "username": username,
+                    "user_index": user_index_from_session if 'user_index_from_session' in locals() else None,
+                    "course_1_questions": len(course_1_questions_list) if course_1_questions_list else 0,
+                    "course_2_questions": len(course_2_questions_list) if course_2_questions_list else 0,
+                    "chatbot_tasks_count": len(chatbot_tasks),
+                    "browser_connected": context.browser.is_connected() if context and context.browser else False
+                }, session_id=session_id)
+                # #endregion
+                
                 log_session_event(
                     session_id, 
                     'INFO', 
@@ -1945,7 +2380,12 @@ async def run_user_session(context, user, questions=None, handle_both_courses=Tr
                 )
                 chatbot_start = time.time()
                 try:
-                    await asyncio.gather(*chatbot_tasks, return_exceptions=True)
+                    # Run chatbot tasks concurrently with timeout to ensure they don't block each other
+                    await run_concurrent_with_timeout(
+                        chatbot_tasks,
+                        timeout=None,  # No timeout for chatbot interactions (they can take a while)
+                        return_exceptions=True
+                    )
                     chatbot_total_time = (time.time() - chatbot_start) * 1000
                     logging.info(f"{log_prefix} ✓ All questions answered in both courses in {chatbot_total_time:.2f}ms")
                     log_session_event(
@@ -1988,6 +2428,18 @@ async def run_user_session(context, user, questions=None, handle_both_courses=Tr
             
             if questions:
                 logging.info(f"{log_prefix} Asking {len(questions)} question(s) in Course {course_number}...")
+                
+                # #region agent log
+                debug_log("H5", f"run_user_session:{1989}", "Conversation start - H5: Resource exhaustion", {
+                    "session_id": session_id,
+                    "username": username,
+                    "user_index": user_index_from_session if 'user_index_from_session' in locals() else None,
+                    "course_number": course_number,
+                    "questions_count": len(questions),
+                    "browser_connected": context.browser.is_connected() if context and context.browser else False
+                }, session_id=session_id)
+                # #endregion
+                
                 log_session_event(
                     session_id, 
                     'INFO', 
@@ -2162,17 +2614,18 @@ async def run_session_with_context(browser, user, session_id, questions=None, qu
     except:
         pass
     
-    # Acquire semaphore only for creating browser context (limit concurrent context creation)
-    semaphore_wait_start = time.time()
-    if semaphore:
-        # #region agent log
-        debug_log("H1", f"run_session:{1601}", "Semaphore acquire attempt start", {
-            "session_id": session_id,
-            "semaphore_available_before": semaphore._value if hasattr(semaphore, '_value') else 'unknown',
-            "username": username,
-            "user_index": user_index_from_session
-        }, session_id=session_id)
-        # #endregion
+        # Acquire semaphore only for creating browser context (limit concurrent context creation)
+        semaphore_wait_start = time.time()
+        if semaphore:
+            # #region agent log
+            debug_log("H2", f"run_session:{2167}", "Semaphore acquire attempt start - H2: Semaphore starvation", {
+                "session_id": session_id,
+                "semaphore_available_before": semaphore._value if hasattr(semaphore, '_value') else 'unknown',
+                "username": username,
+                "user_index": user_index_from_session,
+                "wait_start_time": semaphore_wait_start
+            }, session_id=session_id)
+            # #endregion
         
         await semaphore.acquire()
         semaphore_acquired = True
@@ -2217,6 +2670,16 @@ async def run_session_with_context(browser, user, session_id, questions=None, qu
         
         if not browser_connected:
             error_msg = 'Browser is not connected (after retries)'
+            
+            # #region agent log
+            debug_log("H4", f"run_session:{2218}", "Browser not connected - H4: Browser disconnection", {
+                "session_id": session_id,
+                "username": username,
+                "user_index": user_index_from_session,
+                "error": error_msg
+            }, session_id=session_id)
+            # #endregion
+            
             log_session_event(
                 session_id, 
                 'ERROR', 
@@ -2234,11 +2697,31 @@ async def run_session_with_context(browser, user, session_id, questions=None, qu
         try:
             context_creation_start = time.time()
             
+            # Get current context count before creation
+            current_context_count = 0
+            try:
+                if hasattr(browser, 'contexts'):
+                    current_context_count = len(browser.contexts)
+            except:
+                pass
+            
             # #region agent log
-            debug_log("H2", f"run_session:{1591}", "Context creation start", {
+            debug_log("H1", f"run_session:{2234}", "Context creation start - H1: Browser context limit", {
                 "session_id": session_id,
                 "username": username,
                 "semaphore_held": semaphore_acquired,
+                "user_index": user_index_from_session,
+                "browser_connected": browser.is_connected() if browser else False,
+                "browser_contexts_count_before": current_context_count,
+                "max_concurrent_contexts": STRESS_TEST_CONFIG.get('max_concurrent_contexts', 100)
+            }, session_id=session_id)
+            # #endregion
+            
+            # #region agent log
+            debug_log("H4", f"run_session:{2234}", "Context creation start - H4: Browser disconnection", {
+                "session_id": session_id,
+                "username": username,
+                "browser_connected": browser.is_connected() if browser else False,
                 "user_index": user_index_from_session
             }, session_id=session_id)
             # #endregion
@@ -2246,12 +2729,24 @@ async def run_session_with_context(browser, user, session_id, questions=None, qu
             context = await browser.new_context()
             context_creation_time = (time.time() - context_creation_start) * 1000
             
+            # Get context count after creation
+            context_count_after = 0
+            try:
+                if hasattr(browser, 'contexts'):
+                    context_count_after = len(browser.contexts)
+            except:
+                pass
+            
             # #region agent log
-            debug_log("H2", f"run_session:{1593}", "Context created", {
+            debug_log("H1", f"run_session:{2246}", "Context created successfully - H1: Browser context limit", {
                 "session_id": session_id,
                 "context_creation_time_ms": context_creation_time,
                 "username": username,
-                "user_index": user_index_from_session
+                "user_index": user_index_from_session,
+                "browser_connected": browser.is_connected() if browser else False,
+                "browser_contexts_count_before": current_context_count,
+                "browser_contexts_count_after": context_count_after,
+                "max_concurrent_contexts": STRESS_TEST_CONFIG.get('max_concurrent_contexts', 100)
             }, session_id=session_id)
             # #endregion
             
@@ -2282,6 +2777,26 @@ async def run_session_with_context(browser, user, session_id, questions=None, qu
         except Exception as e:
             import traceback
             error_msg = f'Context creation failed: {str(e)}'
+            
+            # Get context count on failure
+            context_count_on_error = 0
+            try:
+                if hasattr(browser, 'contexts'):
+                    context_count_on_error = len(browser.contexts)
+            except:
+                pass
+            
+            # #region agent log
+            debug_log("H1", f"run_session:{2282}", "Context creation failed - H1: Browser context limit", {
+                "session_id": session_id,
+                "username": username,
+                "user_index": user_index_from_session,
+                "error": str(e),
+                "browser_contexts_count_on_error": context_count_on_error,
+                "max_concurrent_contexts": STRESS_TEST_CONFIG.get('max_concurrent_contexts', 100)
+            }, session_id=session_id)
+            # #endregion
+            
             log_session_event(
                 session_id, 
                 'ERROR', 
@@ -2330,6 +2845,16 @@ async def run_session_with_context(browser, user, session_id, questions=None, qu
         
         if not browser_connected:
             error_msg = 'Browser disconnected before session start (after retries)'
+            
+            # #region agent log
+            debug_log("H4", f"run_session:{2331}", "Browser disconnected before session start - H4: Browser disconnection", {
+                "session_id": session_id,
+                "username": username,
+                "user_index": user_index_from_session,
+                "error": error_msg
+            }, session_id=session_id)
+            # #endregion
+            
             log_session_event(
                 session_id, 
                 'ERROR', 
@@ -2971,14 +3496,27 @@ async def stress_test(browser, users):
             session_id = f"User{user_index+1}_Session{session_idx+1}_{user['username']}"
             
             # #region agent log
-            debug_log("H3", f"stress_test:{2270}", "Task creation start", {
+            debug_log("H1", f"stress_test:{2969}", "Task creation start - H1: Browser context limit", {
                 "session_id": session_id,
                 "user_index": user_index,
                 "session_idx": session_idx,
                 "task_number": len(tasks),
                 "total_tasks_so_far": len(tasks),
                 "username": username,
-                "user_tasks_created": user_task_counts[user_index]
+                "user_tasks_created": user_task_counts[user_index],
+                "total_users": len(users),
+                "current_user_number": user_index + 1
+            }, session_id=session_id)
+            # #endregion
+            
+            # #region agent log
+            debug_log("H2", f"stress_test:{2969}", "Task creation start - H2: Semaphore starvation", {
+                "session_id": session_id,
+                "user_index": user_index,
+                "semaphore_limit": semaphore_limit,
+                "semaphore_available": context_semaphore._value if hasattr(context_semaphore, '_value') else 'unknown',
+                "total_tasks_created": len(tasks),
+                "username": username
             }, session_id=session_id)
             # #endregion
             
@@ -3013,10 +3551,13 @@ async def stress_test(browser, users):
             # #endregion
     
     # #region agent log
-    debug_log("H2", f"stress_test:{2538}", "Task creation completed", {
+    debug_log("H1", f"stress_test:{3015}", "Task creation completed - H1: Browser context limit", {
         "total_tasks_created": len(tasks),
         "user_task_counts": user_task_counts,
-        "expected_total": len(users) * sessions_per_user
+        "expected_total": len(users) * sessions_per_user,
+        "max_concurrent_contexts": max_contexts,
+        "semaphore_limit": semaphore_limit,
+        "total_concurrent_sessions": total_concurrent_sessions
     })
     # #endregion
     
@@ -3054,11 +3595,16 @@ async def stress_test(browser, users):
     debug_log("H4", f"stress_test:{2559}", "asyncio.gather starting execution", {
         "total_tasks": len(tasks),
         "task_creation_order": task_creation_order.copy(),
-        "user_task_counts": user_task_counts
+        "user_task_counts": user_task_counts,
+        "semaphore_limit": semaphore_limit,
+        "semaphore_available": context_semaphore._value if hasattr(context_semaphore, '_value') else 'unknown'
     })
     # #endregion
     
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    # Create tasks immediately to ensure true parallelism - all users start simultaneously
+    # This ensures all users (including users 3-5) run in parallel without blocking
+    task_objects = [asyncio.create_task(task) for task in tasks]
+    results = await asyncio.gather(*task_objects, return_exceptions=True)
     gather_end_time = time.time()
     
     # Analyze which users actually executed
