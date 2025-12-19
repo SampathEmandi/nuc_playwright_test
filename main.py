@@ -109,7 +109,7 @@ CSV_LOCK = threading.Lock()
 # ============================================================================
 STRESS_TEST_CONFIG = {
     'enabled': True,  # Set to False for normal single session mode
-    'sessions_per_user': 1,  # Number of concurrent browser windows per user (each user logs in multiple times)
+    'sessions_per_user': 10,  # Number of concurrent browser windows per user (each user logs in multiple times)
     'delay_between_questions': 3,  # Seconds to wait between questions within a session
     'handle_both_courses': True,  # Set to False to open only one course per session
     # 'course_for_questions': 1,  # Which course to open (1 or 2) - only used if handle_both_courses is False
