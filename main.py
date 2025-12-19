@@ -7,6 +7,35 @@ import random
 from datetime import datetime
 import csv
 import os
+import json
+
+# Debug logging configuration
+DEBUG_LOG_PATH = r"c:\Users\Semandi\Desktop\playwright_nuc\.cursor\debug.log"
+
+def debug_log(hypothesis_id, location, message, data=None, session_id=None, run_id="initial"):
+    """Write debug log entry in NDJSON format."""
+    try:
+        # Ensure directory exists
+        log_dir = os.path.dirname(DEBUG_LOG_PATH)
+        if log_dir and not os.path.exists(log_dir):
+            os.makedirs(log_dir, exist_ok=True)
+        
+        log_entry = {
+            "id": f"log_{int(time.time() * 1000)}_{random.randint(1000, 9999)}",
+            "timestamp": int(time.time() * 1000),
+            "location": location,
+            "message": message,
+            "data": data or {},
+            "sessionId": session_id or "unknown",
+            "runId": run_id,
+            "hypothesisId": hypothesis_id
+        }
+        with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(log_entry) + "\n")
+            f.flush()  # Ensure immediate write
+    except Exception as e:
+        # Log to standard logging instead of silently failing
+        logging.debug(f"Debug log write failed: {e}")
 
 # Configure logging - both console and file
 LOG_FILENAME = None  # Will be set on first log
@@ -53,6 +82,13 @@ def setup_logging():
 LOG_FILENAME = setup_logging()
 logging.info(f"Logging initialized - Log file: {LOG_FILENAME}")
 
+# Test debug logging at startup
+try:
+    debug_log("TEST", "startup", "Debug logging test", {"test": True})
+    logging.info("Debug logging system initialized")
+except Exception as e:
+    logging.warning(f"Debug logging test failed: {e}")
+
 # Global list to store CSV metrics
 CSV_METRICS = []
 
@@ -94,6 +130,8 @@ STRESS_TEST_CONFIG = {
     # Network Monitoring Configuration
     'enable_network_monitoring': True,  # Enable network monitoring for all users (WebSocket and API tracking)
     'monitor_all_users': True,  # Monitor network traffic for all users (not just first 1-2)
+    # Task Distribution Configuration
+    'shuffle_tasks': True,  # Shuffle task execution order to ensure fair distribution (prevents initial sessions from getting priority)
     # Example: 5 users × 1 session = 5 concurrent browser windows, each handling one course
 }
 
@@ -307,9 +345,23 @@ async def open_course(context, course_number, tab_name, session_id=None, usernam
         
         # Setup network monitoring EARLY - before any navigation/network activity
         # This ensures ALL users get monitoring, not just the first 1-2
+        monitoring_setup_start = time.time()
         websocket_requests, api_requests, websocket_timings = setup_network_monitoring(
             page, tab_name, session_id=session_id, username=username
         )
+        monitoring_setup_time = (time.time() - monitoring_setup_start) * 1000
+        
+        # #region agent log
+        debug_log("H5", f"open_course:{307}", "Network monitoring setup completed", {
+            "session_id": session_id,
+            "username": username,
+            "tab_name": tab_name,
+            "course_number": course_number,
+            "setup_time_ms": monitoring_setup_time,
+            "monitoring_enabled": STRESS_TEST_CONFIG.get('enable_network_monitoring', True),
+            "monitor_all_users": STRESS_TEST_CONFIG.get('monitor_all_users', True)
+        }, session_id=session_id)
+        # #endregion
         
         # Verify monitoring is active
         if STRESS_TEST_CONFIG.get('enable_network_monitoring', True) and STRESS_TEST_CONFIG.get('monitor_all_users', True):
@@ -945,9 +997,22 @@ async def interact_with_chatbot(page, tab_name, questions=None, session_id=None,
         
         # Setup network monitoring - ensure it's set up BEFORE any network activity
         # This ensures all users get monitoring, not just the first 1-2
+        monitoring_setup_start = time.time()
         websocket_requests, api_requests, websocket_timings = setup_network_monitoring(
             page, tab_name, session_id=session_id, username=username
         )
+        monitoring_setup_time = (time.time() - monitoring_setup_start) * 1000
+        
+        # #region agent log
+        debug_log("H5", f"interact_with_chatbot:{899}", "Network monitoring setup in chatbot interaction", {
+            "session_id": session_id,
+            "username": username,
+            "tab_name": tab_name,
+            "setup_time_ms": monitoring_setup_time,
+            "monitoring_enabled": STRESS_TEST_CONFIG.get('enable_network_monitoring', True),
+            "monitor_all_users": STRESS_TEST_CONFIG.get('monitor_all_users', True)
+        }, session_id=session_id)
+        # #endregion
         
         # Verify monitoring is active
         if STRESS_TEST_CONFIG.get('enable_network_monitoring', True) and STRESS_TEST_CONFIG.get('monitor_all_users', True):
@@ -1170,6 +1235,15 @@ async def run_user_session(context, user, questions=None, handle_both_courses=Tr
     """
     username = user['username']
     password = user['password']
+    
+    # #region agent log
+    debug_log("H4", f"run_user_session:{1220}", "User session function entry", {
+        "session_id": session_id,
+        "username": username,
+        "handle_both_courses": handle_both_courses,
+        "questions_count": len(questions) if questions else 0
+    }, session_id=session_id)
+    # #endregion
     
     # Handle both single question (backward compatibility) and list of questions
     if questions is None:
@@ -1598,11 +1672,36 @@ async def run_session_with_context(browser, user, session_id, questions=None, qu
     )
     
     # Acquire semaphore only for creating browser context (limit concurrent context creation)
+    semaphore_wait_start = time.time()
     if semaphore:
+        # #region agent log
+        debug_log("H1", f"run_session:{1601}", "Semaphore acquire attempt start", {
+            "session_id": session_id,
+            "semaphore_available_before": semaphore._value if hasattr(semaphore, '_value') else 'unknown',
+            "username": username
+        }, session_id=session_id)
+        # #endregion
+        
         await semaphore.acquire()
         semaphore_acquired = True
+        semaphore_wait_time = (time.time() - semaphore_wait_start) * 1000
+        
+        # #region agent log
+        debug_log("H1", f"run_session:{1603}", "Semaphore acquired", {
+            "session_id": session_id,
+            "wait_time_ms": semaphore_wait_time,
+            "semaphore_available_after": semaphore._value if hasattr(semaphore, '_value') else 'unknown',
+            "username": username
+        }, session_id=session_id)
+        # #endregion
     else:
         semaphore_acquired = False
+        # #region agent log
+        debug_log("H1", f"run_session:{1605}", "No semaphore (None)", {
+            "session_id": session_id,
+            "username": username
+        }, session_id=session_id)
+        # #endregion
     
     # Handle backward compatibility: if question is provided but questions is not, use question
     if questions is None and question is not None:
@@ -1644,7 +1743,27 @@ async def run_session_with_context(browser, user, session_id, questions=None, qu
         
         # Create a new browser context for this session (separate window)
         try:
+            context_creation_start = time.time()
+            
+            # #region agent log
+            debug_log("H2", f"run_session:{1591}", "Context creation start", {
+                "session_id": session_id,
+                "username": username,
+                "semaphore_held": semaphore_acquired
+            }, session_id=session_id)
+            # #endregion
+            
             context = await browser.new_context()
+            context_creation_time = (time.time() - context_creation_start) * 1000
+            
+            # #region agent log
+            debug_log("H2", f"run_session:{1593}", "Context created", {
+                "session_id": session_id,
+                "context_creation_time_ms": context_creation_time,
+                "username": username
+            }, session_id=session_id)
+            # #endregion
+            
             logging.info(f"Session {session_id}: Created new browser context")
             
             # Release semaphore immediately after context creation to allow other sessions to proceed
@@ -1652,6 +1771,15 @@ async def run_session_with_context(browser, user, session_id, questions=None, qu
             if semaphore_acquired:
                 semaphore.release()
                 semaphore_acquired = False
+                
+                # #region agent log
+                debug_log("H1", f"run_session:{1598}", "Semaphore released after context creation", {
+                    "session_id": session_id,
+                    "semaphore_available_after_release": semaphore._value if hasattr(semaphore, '_value') else 'unknown',
+                    "username": username
+                }, session_id=session_id)
+                # #endregion
+                
                 logging.debug(f"Session {session_id}: Released semaphore after context creation")
             log_session_event(
                 session_id, 
@@ -2266,6 +2394,7 @@ async def stress_test(browser, users):
     # Each user gets multiple browser windows (sessions_per_user), all running concurrently
     tasks = []
     session_id_counter = 0
+    task_creation_order = []
     
     for user_index, user in enumerate(users):
         user_questions = user.get('questions', [])
@@ -2276,27 +2405,91 @@ async def stress_test(browser, users):
             session_id_counter += 1
             session_id = f"User{user_index+1}_Session{session_idx+1}_{user['username']}"
             
+            # #region agent log
+            debug_log("H3", f"stress_test:{2270}", "Task creation start", {
+                "session_id": session_id,
+                "user_index": user_index,
+                "session_idx": session_idx,
+                "task_number": len(tasks),
+                "total_tasks_so_far": len(tasks),
+                "username": user['username']
+            }, session_id=session_id)
+            # #endregion
+            
             logging.info(f"Creating session: {session_id} for user {user['username']} "
                         f"(Session {session_idx+1} of {sessions_per_user} for this user)")
             
             # Each session gets its own browser window and will ask all questions concurrently
             # with other sessions from the same user and other users
             # Each window will handle both Course 1 and Course 2 if handle_both_courses is True
-            tasks.append(run_session_with_context(
+            task = run_session_with_context(
                 browser, 
                 user, 
                 session_id, 
                 questions=user_questions,  # Pass all questions
                 handle_both_courses=handle_both_courses,
                 semaphore=context_semaphore
-            ))
+            )
+            tasks.append(task)
+            task_creation_order.append(session_id)
+            
+            # #region agent log
+            debug_log("H3", f"stress_test:{2292}", "Task created and appended", {
+                "session_id": session_id,
+                "task_number": len(tasks) - 1,
+                "total_tasks": len(tasks),
+                "creation_order": task_creation_order.copy()
+            }, session_id=session_id)
+            # #endregion
     
     if not tasks:
         logging.info("No sessions to create, exiting...")
         return
     
-    # Run all sessions concurrently (each opens its own browser window and asks all questions)
-    logging.info(f"\nStarting {len(tasks)} concurrent sessions - all questions will be asked concurrently...")
+    # FIX: Shuffle tasks to ensure fair distribution - prevents initial sessions from getting priority
+    # This randomizes the execution order so all sessions have equal opportunity
+    shuffle_enabled = STRESS_TEST_CONFIG.get('shuffle_tasks', True)
+    task_order_before_shuffle = task_creation_order.copy()
+    
+    if shuffle_enabled:
+        tasks_with_order = list(zip(tasks, task_creation_order))
+        random.shuffle(tasks_with_order)
+        tasks = [task for task, _ in tasks_with_order]
+        task_creation_order = [order for _, order in tasks_with_order]
+        
+        # #region agent log
+        debug_log("H3", f"stress_test:{2460}", "Tasks shuffled for fair distribution", {
+            "total_tasks": len(tasks),
+            "task_order_before": task_order_before_shuffle,
+            "task_order_after": task_creation_order.copy(),
+            "shuffled": True
+        })
+        # #endregion
+        
+        logging.info(f"\nStarting {len(tasks)} concurrent sessions (shuffled for fair distribution)...")
+        logging.info(f"Task execution order has been randomized to ensure equal priority for all sessions")
+    else:
+        # #region agent log
+        debug_log("H3", f"stress_test:{2460}", "Tasks NOT shuffled (shuffle_tasks=False)", {
+            "total_tasks": len(tasks),
+            "task_order": task_creation_order.copy(),
+            "shuffled": False
+        })
+        # #endregion
+        
+        logging.info(f"\nStarting {len(tasks)} concurrent sessions...")
+        logging.info(f"Note: Task shuffling is disabled - tasks will execute in creation order")
+    
+    # #region agent log
+    debug_log("H3", f"stress_test:{2298}", "About to start asyncio.gather", {
+        "total_tasks": len(tasks),
+        "task_order": task_creation_order.copy(),
+        "semaphore_limit": semaphore_limit,
+        "semaphore_available": context_semaphore._value if hasattr(context_semaphore, '_value') else 'unknown',
+        "shuffled": True
+    })
+    # #endregion
+    
     if continuous_mode:
         if continuous_iterations:
             logging.info(f"Continuous mode: Each session will loop through questions {continuous_iterations} times")
@@ -2308,7 +2501,18 @@ async def stress_test(browser, users):
         logging.info(f"Questions will be distributed between courses and asked concurrently")
     if not continuous_mode:
         logging.info(f"Each session will ask all its questions sequentially within its own browser window")
+    
+    gather_start_time = time.time()
     results = await asyncio.gather(*tasks, return_exceptions=True)
+    gather_end_time = time.time()
+    
+    # #region agent log
+    debug_log("H3", f"stress_test:{2310}", "asyncio.gather completed", {
+        "total_tasks": len(tasks),
+        "gather_duration_ms": (gather_end_time - gather_start_time) * 1000,
+        "results_count": len(results)
+    })
+    # #endregion
     
     # Track results
     successful_sessions = 0
