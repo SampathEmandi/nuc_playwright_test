@@ -9,13 +9,13 @@ import csv
 import os
 import json
 
-# Debug logging configuration
-DEBUG_LOG_PATH = r"c:\Users\Semandi\Desktop\playwright_nuc\.cursor\debug.log"
+# Debug logging path is determined dynamically relative to the script's location, inside a 'common' folder
+DEBUG_LOG_PATH = str(Path(__file__).parent / "common" / "debug.log")
 
 def debug_log(hypothesis_id, location, message, data=None, session_id=None, run_id="initial"):
     """Write debug log entry in NDJSON format."""
     try:
-        # Ensure directory exists
+        # Ensure the directory exists
         log_dir = os.path.dirname(DEBUG_LOG_PATH)
         if log_dir and not os.path.exists(log_dir):
             os.makedirs(log_dir, exist_ok=True)
@@ -32,9 +32,8 @@ def debug_log(hypothesis_id, location, message, data=None, session_id=None, run_
         }
         with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
             f.write(json.dumps(log_entry) + "\n")
-            f.flush()  # Ensure immediate write
     except Exception as e:
-        # Log to standard logging instead of silently failing
+        # Silently fail to avoid breaking main flow, but log to standard logging in debug mode
         logging.debug(f"Debug log write failed: {e}")
 
 # Configure logging - both console and file
@@ -82,13 +81,6 @@ def setup_logging():
 LOG_FILENAME = setup_logging()
 logging.info(f"Logging initialized - Log file: {LOG_FILENAME}")
 
-# Test debug logging at startup
-try:
-    debug_log("TEST", "startup", "Debug logging test", {"test": True})
-    logging.info("Debug logging system initialized")
-except Exception as e:
-    logging.warning(f"Debug logging test failed: {e}")
-
 # Global list to store CSV metrics
 CSV_METRICS = []
 
@@ -109,7 +101,7 @@ ERRORS_CSV_EXPORT_FILENAME = None
 # ============================================================================
 STRESS_TEST_CONFIG = {
     'enabled': True,  # Set to False for normal single session mode
-    'sessions_per_user': 4,  # Number of concurrent browser windows per user (each user logs in multiple times)
+    'sessions_per_user': 10,  # Number of concurrent browser windows per user (each user logs in multiple times)
     'delay_between_questions': 3,  # Seconds to wait between questions within a session
     'handle_both_courses': True,  # Set to False to open only one course per session
     'course_for_questions': 1,  # Which course to open (1 or 2) - only used if handle_both_courses is False
@@ -130,8 +122,6 @@ STRESS_TEST_CONFIG = {
     # Network Monitoring Configuration
     'enable_network_monitoring': True,  # Enable network monitoring for all users (WebSocket and API tracking)
     'monitor_all_users': True,  # Monitor network traffic for all users (not just first 1-2)
-    # Task Distribution Configuration
-    'shuffle_tasks': True,  # Shuffle task execution order to ensure fair distribution (prevents initial sessions from getting priority)
     # Example: 5 users × 1 session = 5 concurrent browser windows, each handling one course
 }
 
@@ -333,9 +323,20 @@ async def open_course(context, course_number, tab_name, session_id=None, usernam
         username: Username for logging
     """
     try:
-        # Check if context is still valid
-        if context.browser and not context.browser.is_connected():
-            raise Exception(f"Browser disconnected before opening course {course_number}")
+        # Check if context is still valid (with retry)
+        browser_connected = False
+        for attempt in range(3):
+            try:
+                if context.browser and context.browser.is_connected():
+                    browser_connected = True
+                    break
+            except Exception:
+                pass
+            if attempt < 2:
+                await asyncio.sleep(0.3)
+        
+        if not browser_connected:
+            raise Exception(f"Browser disconnected before opening course {course_number} (after retries)")
         
         logging.info(f"Opening course {course_number} in {tab_name}...")
         page = await context.new_page()
@@ -367,10 +368,21 @@ async def open_course(context, course_number, tab_name, session_id=None, usernam
         if STRESS_TEST_CONFIG.get('enable_network_monitoring', True) and STRESS_TEST_CONFIG.get('monitor_all_users', True):
             logging.info(f"[{tab_name}] ✓ Network monitoring active for course page (user: {username or 'unknown'})")
         
-        # Check again before navigation
-        if context.browser and not context.browser.is_connected():
+        # Check again before navigation (with retry)
+        browser_connected = False
+        for attempt in range(3):
+            try:
+                if context.browser and context.browser.is_connected():
+                    browser_connected = True
+                    break
+            except Exception:
+                pass
+            if attempt < 2:
+                await asyncio.sleep(0.3)
+        
+        if not browser_connected:
             await page.close()
-            raise Exception(f"Browser disconnected before navigation to course {course_number}")
+            raise Exception(f"Browser disconnected before navigation to course {course_number} (after retries)")
         
         # Navigate to dashboard
         await page.goto('https://development.instructure.com', wait_until='domcontentloaded', timeout=60000)
@@ -836,12 +848,79 @@ async def ask_single_question(page, iframe, tab_name, question, question_num, se
                 'error': 'Question box not available'
             }
         
-        # Clear previous question if any
-        try:
-            await question_box.click()
-            await question_box.fill('')  # Clear field
-        except Exception as e:
-            logging.debug(f"[{tab_name}] Could not clear question box: {e}")
+        # Clear previous question if any - with retry
+        question_box_click_success = False
+        question_click_max_retries = 3
+        question_click_retry_delay = 0.5
+        
+        for question_click_attempt in range(1, question_click_max_retries + 1):
+            try:
+                # Ensure question box is still visible and enabled before clicking
+                is_visible = await question_box.is_visible()
+                is_enabled = await question_box.is_enabled()
+                
+                if not is_visible or not is_enabled:
+                    if question_click_attempt < question_click_max_retries:
+                        logging.debug(f"[{tab_name}] Question box not ready (visible={is_visible}, enabled={is_enabled}), retrying...")
+                        await asyncio.sleep(question_click_retry_delay)
+                        # Re-acquire question box
+                        question_box = iframe.get_by_role('textbox', name='Enter your question here')
+                        await question_box.wait_for(state='visible', timeout=5000)
+                        continue
+                    else:
+                        raise Exception(f"Question box not usable: visible={is_visible}, enabled={is_enabled}")
+                
+                # #region agent log
+                debug_log("QUESTION_CLICK", f"ask_single_question:{851}", "Question box click attempt", {
+                    "session_id": session_id,
+                    "username": username,
+                    "tab_name": tab_name,
+                    "question_num": question_num,
+                    "attempt": question_click_attempt
+                }, session_id=session_id)
+                # #endregion
+                
+                await question_box.click()
+                await question_box.fill('')  # Clear field
+                question_box_click_success = True
+                
+                # #region agent log
+                debug_log("QUESTION_CLICK", f"ask_single_question:{853}", "Question box click successful", {
+                    "session_id": session_id,
+                    "username": username,
+                    "tab_name": tab_name,
+                    "question_num": question_num,
+                    "attempt": question_click_attempt
+                }, session_id=session_id)
+                # #endregion
+                
+                break
+            except Exception as e:
+                logging.debug(f"[{tab_name}] Question box click attempt {question_click_attempt} failed: {e}")
+                
+                # #region agent log
+                debug_log("QUESTION_CLICK", f"ask_single_question:{870}", "Question box click failed", {
+                    "session_id": session_id,
+                    "username": username,
+                    "tab_name": tab_name,
+                    "question_num": question_num,
+                    "attempt": question_click_attempt,
+                    "error": str(e)
+                }, session_id=session_id)
+                # #endregion
+                
+                if question_click_attempt < question_click_max_retries:
+                    await asyncio.sleep(question_click_retry_delay)
+                    # Re-acquire question box
+                    try:
+                        question_box = iframe.get_by_role('textbox', name='Enter your question here')
+                        await question_box.wait_for(state='visible', timeout=5000)
+                    except:
+                        pass
+                    continue
+                else:
+                    logging.warning(f"[{tab_name}] Could not clear question box after {question_click_max_retries} attempts: {e}")
+                    # Continue anyway - might still work
         
         # Time the question submission
         question_submit_start = time.time()
@@ -1021,16 +1100,83 @@ async def interact_with_chatbot(page, tab_name, questions=None, session_id=None,
         # Wait for page to fully load
         await page.wait_for_load_state('domcontentloaded', timeout=30000)
         
-        # Click the chatbot button using class selector (matches the working JS code)
+        # Click the chatbot button using class selector (matches the working JS code) - with retry
         chatbot_btn = page.locator('._chatbot_btn_in_iframe')
-        await chatbot_btn.wait_for(state='visible', timeout=30000)
-        await chatbot_btn.scroll_into_view_if_needed()
+        chatbot_click_success = False
+        chatbot_max_retries = 3
+        chatbot_retry_delay = 1
         
-        # Time the chatbot button click
-        click_start = time.time()
-        await chatbot_btn.click(timeout=10000)
-        click_time = (time.time() - click_start) * 1000
-        logging.info(f"[{tab_name}] Chatbot button clicked in {click_time:.2f}ms")
+        for chatbot_attempt in range(1, chatbot_max_retries + 1):
+            try:
+                # Wait for visibility before each attempt
+                await chatbot_btn.wait_for(state='visible', timeout=30000)
+                await chatbot_btn.scroll_into_view_if_needed()
+                
+                # #region agent log
+                debug_log("CHATBOT_CLICK", f"interact_with_chatbot:{1036}", "Chatbot button click attempt", {
+                    "session_id": session_id,
+                    "username": username,
+                    "tab_name": tab_name,
+                    "attempt": chatbot_attempt,
+                    "max_retries": chatbot_max_retries
+                }, session_id=session_id)
+                # #endregion
+                
+                # Time the chatbot button click
+                click_start = time.time()
+                await chatbot_btn.click(timeout=10000)
+                click_time = (time.time() - click_start) * 1000
+                
+                # Verify click was successful by checking if iframe appeared
+                await asyncio.sleep(0.5)  # Brief wait for iframe to appear
+                iframe_check = page.locator('iframe._chatbot_iframe_')
+                try:
+                    await iframe_check.wait_for(state='attached', timeout=5000)
+                    chatbot_click_success = True
+                    logging.info(f"[{tab_name}] ✓ Chatbot button clicked successfully on attempt {chatbot_attempt} in {click_time:.2f}ms")
+                    
+                    # #region agent log
+                    debug_log("CHATBOT_CLICK", f"interact_with_chatbot:{1043}", "Chatbot button click successful", {
+                        "session_id": session_id,
+                        "username": username,
+                        "tab_name": tab_name,
+                        "attempt": chatbot_attempt,
+                        "click_time_ms": click_time
+                    }, session_id=session_id)
+                    # #endregion
+                    
+                    break
+                except:
+                    # Iframe didn't appear, click may have failed
+                    logging.warning(f"[{tab_name}] Chatbot button clicked but iframe not detected on attempt {chatbot_attempt}")
+                    if chatbot_attempt < chatbot_max_retries:
+                        await asyncio.sleep(chatbot_retry_delay)
+                        continue
+                    else:
+                        raise Exception("Chatbot button clicked but iframe never appeared")
+                        
+            except Exception as chatbot_click_error:
+                logging.warning(f"[{tab_name}] Chatbot button click attempt {chatbot_attempt} failed: {chatbot_click_error}")
+                
+                # #region agent log
+                debug_log("CHATBOT_CLICK", f"interact_with_chatbot:{1060}", "Chatbot button click failed", {
+                    "session_id": session_id,
+                    "username": username,
+                    "tab_name": tab_name,
+                    "attempt": chatbot_attempt,
+                    "error": str(chatbot_click_error)
+                }, session_id=session_id)
+                # #endregion
+                
+                if chatbot_attempt < chatbot_max_retries:
+                    logging.info(f"[{tab_name}] Retrying chatbot button click in {chatbot_retry_delay}s...")
+                    await asyncio.sleep(chatbot_retry_delay)
+                    continue
+                else:
+                    raise Exception(f"Failed to click chatbot button after {chatbot_max_retries} attempts: {chatbot_click_error}")
+        
+        if not chatbot_click_success:
+            raise Exception(f"Chatbot button click failed after {chatbot_max_retries} attempts")
         
         # Wait for the chatbot interface to load - wait a bit and then re-acquire iframe
         logging.info(f"Waiting for chatbot interface to load in {tab_name}...")
@@ -1042,16 +1188,95 @@ async def interact_with_chatbot(page, tab_name, questions=None, session_id=None,
         # Setup iframe error and console logging to capture warnings/errors from iframe
         setup_iframe_error_logging(iframe, tab_name, session_id=session_id, username=username)
         
-        # Wait for authorize button in iframe and click
+        # Wait for authorize button in iframe and click - with retry
         logging.info(f"Waiting for authorize button in {tab_name}...")
         authorize_btn = iframe.get_by_role('button', name='Authorize')
-        await authorize_btn.wait_for(state='visible', timeout=30000)
+        authorize_click_success = False
+        authorize_max_retries = 3
+        authorize_retry_delay = 1
         
-        # Time the authorize click
-        auth_start = time.time()
-        await authorize_btn.click()
-        auth_time = (time.time() - auth_start) * 1000
-        logging.info(f"[{tab_name}] Authorize button clicked in {auth_time:.2f}ms")
+        for auth_attempt in range(1, authorize_max_retries + 1):
+            try:
+                # Wait for visibility before each attempt
+                await authorize_btn.wait_for(state='visible', timeout=30000)
+                
+                # #region agent log
+                debug_log("AUTHORIZE_CLICK", f"interact_with_chatbot:{1057}", "Authorize button click attempt", {
+                    "session_id": session_id,
+                    "username": username,
+                    "tab_name": tab_name,
+                    "attempt": auth_attempt,
+                    "max_retries": authorize_max_retries
+                }, session_id=session_id)
+                # #endregion
+                
+                # Time the authorize click
+                auth_start = time.time()
+                await authorize_btn.click()
+                auth_time = (time.time() - auth_start) * 1000
+                
+                # Verify click was successful by waiting a bit and checking if button disappeared or iframe reloaded
+                await asyncio.sleep(1)  # Wait for authorization to process
+                
+                # Check if button is still visible (might mean auth failed) or iframe reloaded (success)
+                try:
+                    # If button is gone or iframe reloaded, auth likely succeeded
+                    is_still_visible = await authorize_btn.is_visible(timeout=2000)
+                    if not is_still_visible:
+                        authorize_click_success = True
+                        logging.info(f"[{tab_name}] ✓ Authorize button clicked successfully on attempt {auth_attempt} in {auth_time:.2f}ms")
+                        
+                        # #region agent log
+                        debug_log("AUTHORIZE_CLICK", f"interact_with_chatbot:{1064}", "Authorize button click successful", {
+                            "session_id": session_id,
+                            "username": username,
+                            "tab_name": tab_name,
+                            "attempt": auth_attempt,
+                            "click_time_ms": auth_time
+                        }, session_id=session_id)
+                        # #endregion
+                        
+                        break
+                    else:
+                        # Button still visible - might need to retry
+                        logging.warning(f"[{tab_name}] Authorize button still visible after click on attempt {auth_attempt}")
+                        if auth_attempt < authorize_max_retries:
+                            await asyncio.sleep(authorize_retry_delay)
+                            continue
+                except:
+                    # Button check failed - likely means iframe reloaded (success)
+                    authorize_click_success = True
+                    logging.info(f"[{tab_name}] ✓ Authorize button clicked successfully on attempt {auth_attempt} in {auth_time:.2f}ms (iframe likely reloaded)")
+                    break
+                    
+            except Exception as auth_click_error:
+                logging.warning(f"[{tab_name}] Authorize button click attempt {auth_attempt} failed: {auth_click_error}")
+                
+                # #region agent log
+                debug_log("AUTHORIZE_CLICK", f"interact_with_chatbot:{1095}", "Authorize button click failed", {
+                    "session_id": session_id,
+                    "username": username,
+                    "tab_name": tab_name,
+                    "attempt": auth_attempt,
+                    "error": str(auth_click_error)
+                }, session_id=session_id)
+                # #endregion
+                
+                if auth_attempt < authorize_max_retries:
+                    logging.info(f"[{tab_name}] Retrying authorize button click in {authorize_retry_delay}s...")
+                    await asyncio.sleep(authorize_retry_delay)
+                    # Re-acquire iframe in case it changed
+                    try:
+                        iframe = await get_iframe_content_frame(page, tab_name)
+                        authorize_btn = iframe.get_by_role('button', name='Authorize')
+                    except:
+                        pass
+                    continue
+                else:
+                    raise Exception(f"Failed to click authorize button after {authorize_max_retries} attempts: {auth_click_error}")
+        
+        if not authorize_click_success:
+            raise Exception(f"Authorize button click failed after {authorize_max_retries} attempts")
         
         # Wait for the chatbot interface to reload after authorization
         logging.info(f"Waiting for chatbot interface to reload after authorization in {tab_name}...")
@@ -1092,83 +1317,103 @@ async def interact_with_chatbot(page, tab_name, questions=None, session_id=None,
             logging.info(f"[{tab_name}] ⚡ CONCURRENT QUESTIONS MODE ENABLED - All questions will be asked simultaneously")
         
         while True:
-            cycle_count += 1
-            if continuous_mode:
-                logging.info(f"[{tab_name}] ========== Starting Question Cycle {cycle_count} ==========")
-            
-            if concurrent_questions:
-                # CONCURRENT MODE: Ask all questions simultaneously
-                logging.info(f"[{tab_name}] 🚀 Launching {len(questions_to_use)} questions concurrently...")
-                question_tasks = []
-                for question_num, question in enumerate(questions_to_use, 1):
-                    question_tasks.append(
-                        ask_single_question(
+            try:
+                cycle_count += 1
+                if continuous_mode:
+                    logging.info(f"[{tab_name}] ========== Starting Question Cycle {cycle_count} ==========")
+                
+                if concurrent_questions:
+                    # CONCURRENT MODE: Ask all questions simultaneously
+                    logging.info(f"[{tab_name}] 🚀 Launching {len(questions_to_use)} questions concurrently...")
+                    question_tasks = []
+                    for question_num, question in enumerate(questions_to_use, 1):
+                        question_tasks.append(
+                            ask_single_question(
+                                page, iframe, tab_name, question, question_num,
+                                session_id=session_id, course_number=course_number,
+                                username=username, question_metrics=question_metrics
+                            )
+                        )
+                    
+                    # Launch all questions concurrently
+                    cycle_question_start = time.time()
+                    results = await asyncio.gather(*question_tasks, return_exceptions=True)
+                    cycle_question_time = (time.time() - cycle_question_start) * 1000
+                    
+                    # Process results
+                    for result in results:
+                        if isinstance(result, Exception):
+                            logging.error(f"[{tab_name}] Question task failed with exception: {result}")
+                            question_metrics.append({
+                                'question_number': len(question_metrics) + 1,
+                                'question': 'Unknown',
+                                'question_submit_time': 0,
+                                'response_wait_time': 0,
+                                'question_total_time': 0,
+                                'response_received': False,
+                                'error': str(result)
+                            })
+                        elif isinstance(result, dict):
+                            question_metrics.append(result)
+                    
+                    logging.info(f"[{tab_name}] ✅ All {len(questions_to_use)} questions completed concurrently in {cycle_question_time:.2f}ms")
+                else:
+                    # SEQUENTIAL MODE: Ask questions one by one (original behavior)
+                    for question_num, question in enumerate(questions_to_use, 1):
+                        metric = await ask_single_question(
                             page, iframe, tab_name, question, question_num,
                             session_id=session_id, course_number=course_number,
                             username=username, question_metrics=question_metrics
                         )
-                    )
-                
-                # Launch all questions concurrently
-                cycle_question_start = time.time()
-                results = await asyncio.gather(*question_tasks, return_exceptions=True)
-                cycle_question_time = (time.time() - cycle_question_start) * 1000
-                
-                # Process results
-                for result in results:
-                    if isinstance(result, Exception):
-                        logging.error(f"[{tab_name}] Question task failed with exception: {result}")
-                        question_metrics.append({
-                            'question_number': len(question_metrics) + 1,
-                            'question': 'Unknown',
-                            'question_submit_time': 0,
-                            'response_wait_time': 0,
-                            'question_total_time': 0,
-                            'response_received': False,
-                            'error': str(result)
-                        })
-                    elif isinstance(result, dict):
-                        question_metrics.append(result)
-                
-                logging.info(f"[{tab_name}] ✅ All {len(questions_to_use)} questions completed concurrently in {cycle_question_time:.2f}ms")
-            else:
-                # SEQUENTIAL MODE: Ask questions one by one (original behavior)
-                for question_num, question in enumerate(questions_to_use, 1):
-                    metric = await ask_single_question(
-                        page, iframe, tab_name, question, question_num,
-                        session_id=session_id, course_number=course_number,
-                        username=username, question_metrics=question_metrics
-                    )
-                    question_metrics.append(metric)
-                    
-                    # Delay between questions - configurable for WebSocket stress testing
-                    if question_num < len(questions_to_use):
-                        # Check if rapid fire mode is enabled for WebSocket stress
-                        if STRESS_TEST_CONFIG.get('websocket_rapid_fire', False):
-                            # Minimal delay - just enough for UI to be ready
-                            delay = 0.5
-                            logging.info(f"[{tab_name}] Rapid fire mode - minimal delay ({delay}s) before next question...")
-                        else:
-                            # Use configured delay
-                            delay = STRESS_TEST_CONFIG.get('delay_between_questions', 3)
-                            logging.info(f"[{tab_name}] Waiting {delay}s before next question...")
-                        await asyncio.sleep(delay)
+                        question_metrics.append(metric)
+                        
+                        # Delay between questions - configurable for WebSocket stress testing
+                        if question_num < len(questions_to_use):
+                            # Check if rapid fire mode is enabled for WebSocket stress
+                            if STRESS_TEST_CONFIG.get('websocket_rapid_fire', False):
+                                # Minimal delay - just enough for UI to be ready
+                                delay = 0.5
+                                logging.info(f"[{tab_name}] Rapid fire mode - minimal delay ({delay}s) before next question...")
+                            else:
+                                # Use configured delay
+                                delay = STRESS_TEST_CONFIG.get('delay_between_questions', 3)
+                                logging.info(f"[{tab_name}] Waiting {delay}s before next question...")
+                            await asyncio.sleep(delay)
             
-            # After completing all questions in cycle (both concurrent and sequential modes)
-            if continuous_mode:
-                # Check if we should continue
-                if continuous_iterations and cycle_count >= continuous_iterations:
-                    logging.info(f"[{tab_name}] Completed {cycle_count} cycles (requested: {continuous_iterations}), stopping continuous mode")
-                    break
+                # After completing all questions in cycle (both concurrent and sequential modes)
+                if continuous_mode:
+                    # Check if we should continue
+                    if continuous_iterations and cycle_count >= continuous_iterations:
+                        logging.info(f"[{tab_name}] Completed {cycle_count} cycles (requested: {continuous_iterations}), stopping continuous mode")
+                        break
+                    else:
+                        logging.info(f"[{tab_name}] Completed cycle {cycle_count}, waiting {cycle_delay}s before next cycle...")
+                        await asyncio.sleep(cycle_delay)
+                        # Shuffle questions for next cycle to add variety
+                        random.shuffle(questions_to_use)
+                        logging.info(f"[{tab_name}] Starting next cycle with shuffled questions")
                 else:
-                    logging.info(f"[{tab_name}] Completed cycle {cycle_count}, waiting {cycle_delay}s before next cycle...")
-                    await asyncio.sleep(cycle_delay)
-                    # Shuffle questions for next cycle to add variety
-                    random.shuffle(questions_to_use)
-                    logging.info(f"[{tab_name}] Starting next cycle with shuffled questions")
-            else:
-                # Not in continuous mode, exit after one cycle
-                break
+                    # Not in continuous mode, exit after one cycle
+                    break
+            except Exception as cycle_error:
+                # Handle errors in continuous mode - log but continue if in continuous mode
+                import traceback
+                logging.error(f"[{tab_name}] Error in cycle {cycle_count}: {cycle_error}")
+                logging.error(f"[{tab_name}] Traceback: {traceback.format_exc()}")
+                
+                if continuous_mode:
+                    # In continuous mode, try to recover and continue
+                    if continuous_iterations and cycle_count >= continuous_iterations:
+                        logging.warning(f"[{tab_name}] Error occurred but reached max iterations, stopping")
+                        break
+                    else:
+                        logging.warning(f"[{tab_name}] Error in cycle, waiting {cycle_delay}s before retrying...")
+                        await asyncio.sleep(cycle_delay)
+                        # Continue to next cycle instead of breaking
+                        continue
+                else:
+                    # Not in continuous mode, re-raise to exit
+                    raise
         
         total_interaction_time = (time.time() - total_interaction_start) * 1000
         
@@ -1271,17 +1516,25 @@ async def run_user_session(context, user, questions=None, handle_both_courses=Tr
         handle_both_courses=handle_both_courses
     )
     
-    # Check if context is still valid
-    try:
-        if context.browser and not context.browser.is_connected():
-            raise Exception("Browser is not connected")
-    except Exception as e:
-        error_msg = f"Context invalid: {str(e)}"
+    # Check if context is still valid (with retry)
+    browser_connected = False
+    for attempt in range(3):
+        try:
+            if context.browser and context.browser.is_connected():
+                browser_connected = True
+                break
+        except Exception:
+            pass
+        if attempt < 2:
+            await asyncio.sleep(0.3)
+    
+    if not browser_connected:
+        error_msg = "Browser is not connected (after retries)"
         log_session_event(
             session_id, 
             'ERROR', 
             error_msg,
-            error=str(e),
+            error=error_msg,
             username=username,
             stage='context_validation'
         )
@@ -1302,18 +1555,37 @@ async def run_user_session(context, user, questions=None, handle_both_courses=Tr
     course_open_time_ms = 0
     
     try:
-        # Check context before creating page
-        if context.browser and not context.browser.is_connected():
-            raise Exception("Browser disconnected before creating login page")
+        # Check context before creating page (with retry)
+        browser_connected = False
+        for attempt in range(3):
+            try:
+                if context.browser and context.browser.is_connected():
+                    browser_connected = True
+                    break
+            except Exception:
+                pass
+            if attempt < 2:
+                await asyncio.sleep(0.3)
+        
+        if not browser_connected:
+            raise Exception("Browser disconnected before creating login page (after retries)")
         
         login_page = await context.new_page()
+        
+        # Track login errors and warnings
+        login_errors = []
+        login_warnings = []
+        login_errors_start_count = len(PAGE_ERRORS)  # Track errors before login
         
         # Setup error and console logging for login page
         setup_page_error_logging(login_page, "Login Page", session_id=session_id, username=username)
         
-        # Login
-        logging.info(f"{log_prefix} Logging in...")
+        # Login with retry logic
+        login_max_retries = 3
+        login_retry_delay = 2  # seconds between retries
+        login_successful = False
         login_start_time = time.time()
+        
         log_session_event(
             session_id, 
             'INFO', 
@@ -1321,35 +1593,214 @@ async def run_user_session(context, user, questions=None, handle_both_courses=Tr
             username=username,
             stage='login_start'
         )
-        # Check again before navigation
-        if context.browser and not context.browser.is_connected():
-            raise Exception("Browser disconnected before navigation")
         
-        try:
-            await login_page.goto('https://development.instructure.com/login/ldap', wait_until='domcontentloaded', timeout=60000)
+        for login_attempt in range(1, login_max_retries + 1):
+            logging.info(f"{log_prefix} Login attempt {login_attempt}/{login_max_retries}...")
             
-            await login_page.fill("#pseudonym_session_unique_id", username)
-            await login_page.fill("#pseudonym_session_password", password)
+            # #region agent log
+            debug_log("LOGIN_RETRY", f"run_user_session:{1365}", "Login attempt start", {
+                "session_id": session_id,
+                "username": username,
+                "attempt": login_attempt,
+                "max_retries": login_max_retries
+            }, session_id=session_id)
+            # #endregion
             
-            # Click login button
-            await login_page.click("#login_form > div.ic-Login__actions > div.ic-Form-control.ic-Form-control--login > input")
+            # Check again before navigation (with retry)
+            browser_connected = False
+            for attempt in range(3):
+                try:
+                    if context.browser and context.browser.is_connected():
+                        browser_connected = True
+                        break
+                except Exception:
+                    pass
+                if attempt < 2:
+                    await asyncio.sleep(0.3)
             
-            # Wait for dashboard to load - wait for both course cards to be visible (with retry)
-            logging.info(f"{log_prefix} Waiting for dashboard to load...")
-            dashboard_locator = login_page.locator('#DashboardCard_Container')
-            await dashboard_locator.wait_for(state='visible', timeout=60000)
-        except Exception as login_error:
-            import traceback
+            if not browser_connected:
+                logging.warning(f"{log_prefix} Browser disconnected before login attempt {login_attempt}")
+                if login_attempt < login_max_retries:
+                    await asyncio.sleep(login_retry_delay)
+                    continue
+                else:
+                    raise Exception("Browser disconnected before navigation (after retries)")
+            
+            try:
+                # Navigate to login page
+                await login_page.goto('https://development.instructure.com/login/ldap', wait_until='domcontentloaded', timeout=60000)
+                
+                # Fill login credentials
+                await login_page.fill("#pseudonym_session_unique_id", username)
+                await login_page.fill("#pseudonym_session_password", password)
+                
+                # Click login button
+                await login_page.click("#login_form > div.ic-Login__actions > div.ic-Form-control.ic-Form-control--login > input")
+                
+                # Wait for dashboard to load - this confirms login was successful
+                logging.info(f"{log_prefix} Waiting for dashboard to load (attempt {login_attempt})...")
+                dashboard_locator = login_page.locator('#DashboardCard_Container')
+                
+                try:
+                    await dashboard_locator.wait_for(state='visible', timeout=60000)
+                    # Dashboard is visible - login successful!
+                    login_successful = True
+                    
+                    # #region agent log
+                    debug_log("LOGIN_RETRY", f"run_user_session:{1402}", "Login successful", {
+                        "session_id": session_id,
+                        "username": username,
+                        "attempt": login_attempt
+                    }, session_id=session_id)
+                    # #endregion
+                    
+                    logging.info(f"{log_prefix} ✓ Login successful on attempt {login_attempt}")
+                    
+                    # Collect any errors/warnings that occurred during login
+                    login_errors_end_count = len(PAGE_ERRORS)
+                    for error_idx in range(login_errors_start_count, login_errors_end_count):
+                        error = PAGE_ERRORS[error_idx]
+                        if error.get('tab_name') == 'Login Page' or error.get('session_id') == session_id:
+                            if error.get('type') in ['CONSOLE_ERROR', 'PAGE_ERROR', 'REQUEST_FAILED']:
+                                login_errors.append(error)
+                            elif error.get('type') == 'CONSOLE_WARNING':
+                                login_warnings.append(error)
+                    
+                    break  # Exit retry loop
+                except Exception as dashboard_error:
+                    # Dashboard didn't appear - login likely failed
+                    error_msg = f"Dashboard not visible after login attempt {login_attempt}: {dashboard_error}"
+                    logging.warning(f"{log_prefix} {error_msg}")
+                    
+                    # Record as warning
+                    login_warnings.append({
+                        'type': 'LOGIN_WARNING',
+                        'message': error_msg,
+                        'attempt': login_attempt,
+                        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+                    })
+                    
+                    # Check if we're still on login page (login failed) or error page
+                    current_url = login_page.url
+                    page_content = await login_page.content()
+                    
+                    # #region agent log
+                    debug_log("LOGIN_RETRY", f"run_user_session:{1415}", "Login failed - dashboard not visible", {
+                        "session_id": session_id,
+                        "username": username,
+                        "attempt": login_attempt,
+                        "current_url": current_url,
+                        "error": str(dashboard_error)
+                    }, session_id=session_id)
+                    # #endregion
+                    
+                    if login_attempt < login_max_retries:
+                        logging.info(f"{log_prefix} Retrying login in {login_retry_delay}s...")
+                        await asyncio.sleep(login_retry_delay)
+                        # Reload login page for next attempt
+                        await login_page.reload(wait_until='domcontentloaded', timeout=30000)
+                        continue
+                    else:
+                        raise Exception(f"Login failed after {login_max_retries} attempts: Dashboard not visible. Last error: {dashboard_error}")
+                        
+            except Exception as login_error:
+                import traceback
+                error_msg = str(login_error)
+                logging.warning(f"{log_prefix} Login attempt {login_attempt} failed: {error_msg}")
+                
+                # Record error
+                login_errors.append({
+                    'type': 'LOGIN_ERROR',
+                    'message': error_msg,
+                    'attempt': login_attempt,
+                    'traceback': traceback.format_exc(),
+                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+                })
+                
+                # Collect any page errors that occurred during this attempt
+                login_errors_end_count = len(PAGE_ERRORS)
+                for error_idx in range(login_errors_start_count, login_errors_end_count):
+                    error = PAGE_ERRORS[error_idx]
+                    if error.get('tab_name') == 'Login Page' or error.get('session_id') == session_id:
+                        if error.get('type') in ['CONSOLE_ERROR', 'PAGE_ERROR', 'REQUEST_FAILED']:
+                            if error not in login_errors:  # Avoid duplicates
+                                login_errors.append(error)
+                        elif error.get('type') == 'CONSOLE_WARNING':
+                            if error not in login_warnings:  # Avoid duplicates
+                                login_warnings.append(error)
+                
+                # #region agent log
+                debug_log("LOGIN_RETRY", f"run_user_session:{1430}", "Login attempt exception", {
+                    "session_id": session_id,
+                    "username": username,
+                    "attempt": login_attempt,
+                    "error": error_msg
+                }, session_id=session_id)
+                # #endregion
+                
+                if login_attempt < login_max_retries:
+                    logging.info(f"{log_prefix} Retrying login in {login_retry_delay}s...")
+                    await asyncio.sleep(login_retry_delay)
+                    # Reload login page for next attempt
+                    try:
+                        await login_page.reload(wait_until='domcontentloaded', timeout=30000)
+                    except:
+                        pass  # If reload fails, next attempt will navigate again
+                    continue
+                else:
+                    # Last attempt failed - record all errors/warnings at session level
+                    errors_summary = f"{len(login_errors)} error(s), {len(login_warnings)} warning(s)"
+                    error_details = {
+                        'errors': login_errors,
+                        'warnings': login_warnings,
+                        'total_errors': len(login_errors),
+                        'total_warnings': len(login_warnings)
+                    }
+                    
+                    log_session_event(
+                        session_id, 
+                        'ERROR', 
+                        f'Login failed after {login_max_retries} attempts: {error_msg}. {errors_summary}',
+                        error=error_msg,
+                        traceback_text=traceback.format_exc(),
+                        username=username,
+                        stage='login_process',
+                        login_attempts=login_max_retries,
+                        login_errors=login_errors,
+                        login_warnings=login_warnings,
+                        **error_details
+                    )
+                    raise Exception(f"Login failed after {login_max_retries} attempts: {error_msg}")
+        
+        if not login_successful:
+            # Collect final errors/warnings even if login failed
+            login_errors_end_count = len(PAGE_ERRORS)
+            for error_idx in range(login_errors_start_count, login_errors_end_count):
+                error = PAGE_ERRORS[error_idx]
+                if error.get('tab_name') == 'Login Page' or error.get('session_id') == session_id:
+                    if error.get('type') in ['CONSOLE_ERROR', 'PAGE_ERROR', 'REQUEST_FAILED']:
+                        if error not in login_errors:
+                            login_errors.append(error)
+                    elif error.get('type') == 'CONSOLE_WARNING':
+                        if error not in login_warnings:
+                            login_warnings.append(error)
+            
+            # Record at session level
+            errors_summary = f"{len(login_errors)} error(s), {len(login_warnings)} warning(s)"
             log_session_event(
-                session_id, 
-                'ERROR', 
-                f'Login failed: {str(login_error)}',
-                error=str(login_error),
-                traceback_text=traceback.format_exc(),
+                session_id,
+                'ERROR',
+                f'Login failed after {login_max_retries} attempts - dashboard never appeared. {errors_summary}',
+                error=f'Dashboard never appeared after {login_max_retries} attempts',
                 username=username,
-                stage='login_process'
+                stage='login_process',
+                login_attempts=login_max_retries,
+                login_errors=login_errors,
+                login_warnings=login_warnings,
+                total_errors=len(login_errors),
+                total_warnings=len(login_warnings)
             )
-            raise
+            raise Exception(f"Login failed after {login_max_retries} attempts - dashboard never appeared")
         
         # Wait for both course cards to be visible with retry logic
         logging.info(f"{log_prefix} Waiting for Course 1 and Course 2 cards to be visible...")
@@ -1379,13 +1830,41 @@ async def run_user_session(context, user, questions=None, handle_both_courses=Tr
         logging.info(f"{log_prefix} Dashboard loaded successfully")
         login_end_time = time.time()
         login_time_ms = (login_end_time - login_start_time) * 1000 if login_start_time else 0
+        
+        # Final collection of errors/warnings after successful login
+        login_errors_end_count = len(PAGE_ERRORS)
+        for error_idx in range(login_errors_start_count, login_errors_end_count):
+            error = PAGE_ERRORS[error_idx]
+            if error.get('tab_name') == 'Login Page' or error.get('session_id') == session_id:
+                if error.get('type') in ['CONSOLE_ERROR', 'PAGE_ERROR', 'REQUEST_FAILED']:
+                    if error not in login_errors:
+                        login_errors.append(error)
+                elif error.get('type') == 'CONSOLE_WARNING':
+                    if error not in login_warnings:
+                        login_warnings.append(error)
+        
+        # Record login completion with errors/warnings summary at session level
+        errors_summary = ""
+        if login_errors or login_warnings:
+            errors_summary = f" ({len(login_errors)} error(s), {len(login_warnings)} warning(s) during login)"
+            if login_errors:
+                logging.warning(f"{log_prefix} Login completed with {len(login_errors)} error(s):")
+                for err in login_errors:
+                    logging.warning(f"{log_prefix}   - {err.get('type', 'UNKNOWN')}: {err.get('message', 'No message')[:100]}")
+            if login_warnings:
+                logging.info(f"{log_prefix} Login completed with {len(login_warnings)} warning(s)")
+        
         log_session_event(
             session_id, 
             'INFO', 
-            f'Login completed successfully in {login_time_ms:.2f}ms',
+            f'Login completed successfully in {login_time_ms:.2f}ms{errors_summary}',
             username=username,
             stage='login_complete',
-            login_time_ms=round(login_time_ms, 2)
+            login_time_ms=round(login_time_ms, 2),
+            login_errors=login_errors if login_errors else [],
+            login_warnings=login_warnings if login_warnings else [],
+            total_login_errors=len(login_errors),
+            total_login_warnings=len(login_warnings)
         )
         
         # Close login page (no longer needed)
@@ -1671,6 +2150,18 @@ async def run_session_with_context(browser, user, session_id, questions=None, qu
         handle_both_courses=handle_both_courses
     )
     
+    # Extract user index from session_id for tracking
+    user_index_from_session = None
+    try:
+        # session_id format: "User{index}_Session{idx}_{username}"
+        if session_id and session_id.startswith("User"):
+            parts = session_id.split("_")
+            if len(parts) > 0:
+                user_part = parts[0]  # "User1", "User2", etc.
+                user_index_from_session = int(user_part.replace("User", "")) - 1  # Convert to 0-based
+    except:
+        pass
+    
     # Acquire semaphore only for creating browser context (limit concurrent context creation)
     semaphore_wait_start = time.time()
     if semaphore:
@@ -1678,7 +2169,8 @@ async def run_session_with_context(browser, user, session_id, questions=None, qu
         debug_log("H1", f"run_session:{1601}", "Semaphore acquire attempt start", {
             "session_id": session_id,
             "semaphore_available_before": semaphore._value if hasattr(semaphore, '_value') else 'unknown',
-            "username": username
+            "username": username,
+            "user_index": user_index_from_session
         }, session_id=session_id)
         # #endregion
         
@@ -1691,7 +2183,8 @@ async def run_session_with_context(browser, user, session_id, questions=None, qu
             "session_id": session_id,
             "wait_time_ms": semaphore_wait_time,
             "semaphore_available_after": semaphore._value if hasattr(semaphore, '_value') else 'unknown',
-            "username": username
+            "username": username,
+            "user_index": user_index_from_session
         }, session_id=session_id)
         # #endregion
     else:
@@ -1699,7 +2192,8 @@ async def run_session_with_context(browser, user, session_id, questions=None, qu
         # #region agent log
         debug_log("H1", f"run_session:{1605}", "No semaphore (None)", {
             "session_id": session_id,
-            "username": username
+            "username": username,
+            "user_index": user_index_from_session
         }, session_id=session_id)
         # #endregion
     
@@ -1708,31 +2202,26 @@ async def run_session_with_context(browser, user, session_id, questions=None, qu
         questions = [question]
     
     try:
-        # Check if browser is still open before proceeding
-        try:
-            if not browser.is_connected():
-                error_msg = 'Browser is not connected'
-                log_session_event(
-                    session_id, 
-                    'ERROR', 
-                    error_msg,
-                    error=error_msg,
-                    username=username,
-                    stage='browser_check'
-                )
-                logging.error(f"Session {session_id}: {error_msg}")
-                if semaphore_acquired:
-                    semaphore.release()
-                return {'session_id': session_id, 'success': False, 'error': error_msg}
-        except Exception as e:
-            import traceback
-            error_msg = f'Browser check failed: {str(e)}'
+        # Check if browser is still open before proceeding (with retry)
+        browser_check_attempts = 3
+        browser_connected = False
+        for attempt in range(browser_check_attempts):
+            try:
+                if browser.is_connected():
+                    browser_connected = True
+                    break
+            except Exception as e:
+                logging.debug(f"Session {session_id}: Browser check attempt {attempt + 1} failed: {e}")
+                if attempt < browser_check_attempts - 1:
+                    await asyncio.sleep(0.5)  # Wait before retry
+        
+        if not browser_connected:
+            error_msg = 'Browser is not connected (after retries)'
             log_session_event(
                 session_id, 
                 'ERROR', 
                 error_msg,
-                error=str(e),
-                traceback_text=traceback.format_exc(),
+                error=error_msg,
                 username=username,
                 stage='browser_check'
             )
@@ -1749,7 +2238,8 @@ async def run_session_with_context(browser, user, session_id, questions=None, qu
             debug_log("H2", f"run_session:{1591}", "Context creation start", {
                 "session_id": session_id,
                 "username": username,
-                "semaphore_held": semaphore_acquired
+                "semaphore_held": semaphore_acquired,
+                "user_index": user_index_from_session
             }, session_id=session_id)
             # #endregion
             
@@ -1760,7 +2250,8 @@ async def run_session_with_context(browser, user, session_id, questions=None, qu
             debug_log("H2", f"run_session:{1593}", "Context created", {
                 "session_id": session_id,
                 "context_creation_time_ms": context_creation_time,
-                "username": username
+                "username": username,
+                "user_index": user_index_from_session
             }, session_id=session_id)
             # #endregion
             
@@ -1824,9 +2315,21 @@ async def run_session_with_context(browser, user, session_id, questions=None, qu
         # Small delay to ensure context is ready
         await asyncio.sleep(0.2)
         
-        # Verify browser is still connected before running session
-        if not browser.is_connected():
-            error_msg = 'Browser disconnected before session start'
+        # Verify browser is still connected before running session (with retry)
+        browser_check_attempts = 3
+        browser_connected = False
+        for attempt in range(browser_check_attempts):
+            try:
+                if browser.is_connected():
+                    browser_connected = True
+                    break
+            except Exception as e:
+                logging.debug(f"Session {session_id}: Browser check attempt {attempt + 1} failed: {e}")
+                if attempt < browser_check_attempts - 1:
+                    await asyncio.sleep(0.5)  # Wait before retry
+        
+        if not browser_connected:
+            error_msg = 'Browser disconnected before session start (after retries)'
             log_session_event(
                 session_id, 
                 'ERROR', 
@@ -1840,6 +2343,15 @@ async def run_session_with_context(browser, user, session_id, questions=None, qu
         
         # Run the session with the questions (handles both courses if enabled)
         try:
+            # #region agent log
+            debug_log("H4", f"run_session:{1826}", "About to execute user session", {
+                "session_id": session_id,
+                "username": username,
+                "user_index": user_index_from_session,
+                "questions_count": len(questions) if questions else 0
+            }, session_id=session_id)
+            # #endregion
+            
             log_session_event(
                 session_id, 
                 'INFO', 
@@ -1848,6 +2360,14 @@ async def run_session_with_context(browser, user, session_id, questions=None, qu
                 stage='session_execution_start'
             )
             await run_user_session(context, user, questions, handle_both_courses, session_id=session_id)
+            
+            # #region agent log
+            debug_log("H4", f"run_session:{1834}", "User session execution completed", {
+                "session_id": session_id,
+                "username": username,
+                "user_index": user_index_from_session
+            }, session_id=session_id)
+            # #endregion
             session_duration = (time.time() - session_start_time) * 1000
             log_session_event(
                 session_id, 
@@ -1900,7 +2420,20 @@ async def run_session_with_context(browser, user, session_id, questions=None, qu
         return {'session_id': session_id, 'success': False, 'error': error_msg, 'duration_ms': session_duration}
     finally:
         # Close the context (browser window) for this session - only after session completes or fails
-        if context:
+        # BUT: Check if continuous mode is active - if so, don't close immediately
+        continuous_mode = STRESS_TEST_CONFIG.get('continuous_mode', False)
+        continuous_iterations = STRESS_TEST_CONFIG.get('continuous_iterations', None)
+        
+        # Only close if not in infinite continuous mode, or if session explicitly completed/failed
+        should_close = True
+        if continuous_mode and continuous_iterations is None:
+            # Infinite continuous mode - check if session actually completed
+            # If we're in finally due to normal completion, we should close
+            # But if it's due to an error, we might want to keep it open for retry
+            # For now, we'll close but log a warning
+            logging.info(f"Session {session_id}: Continuous mode was active, but session ended - closing context")
+        
+        if context and should_close:
             try:
                 logging.info(f"Session {session_id}: Starting cleanup...")
                 log_session_event(
@@ -1911,7 +2444,14 @@ async def run_session_with_context(browser, user, session_id, questions=None, qu
                     stage='cleanup_start'
                 )
                 # Check if browser is still connected before cleanup
-                if context.browser and context.browser.is_connected():
+                browser_connected = False
+                try:
+                    if context.browser and context.browser.is_connected():
+                        browser_connected = True
+                except Exception as e:
+                    logging.debug(f"Session {session_id}: Could not check browser connection: {e}")
+                
+                if browser_connected:
                     # Close all pages first
                     pages_closed = 0
                     for page in context.pages:
@@ -1936,26 +2476,29 @@ async def run_session_with_context(browser, user, session_id, questions=None, qu
                     await asyncio.sleep(0.5)
                     
                     # Close context only if browser is still connected
-                    if context.browser.is_connected():
-                        await context.close()
-                        logging.info(f"Session {session_id}: Closed browser context (session completed or failed)")
-                        log_session_event(
-                            session_id, 
-                            'INFO', 
-                            'Session cleanup completed successfully',
-                            username=username,
-                            stage='cleanup_complete',
-                            pages_closed=pages_closed
-                        )
-                    else:
-                        logging.warning(f"Session {session_id}: Browser disconnected, skipping context close")
-                        log_session_event(
-                            session_id, 
-                            'WARNING', 
-                            'Browser disconnected during cleanup, skipping context close',
-                            username=username,
-                            stage='cleanup_skip'
-                        )
+                    try:
+                        if context.browser.is_connected():
+                            await context.close()
+                            logging.info(f"Session {session_id}: Closed browser context (session completed or failed)")
+                            log_session_event(
+                                session_id, 
+                                'INFO', 
+                                'Session cleanup completed successfully',
+                                username=username,
+                                stage='cleanup_complete',
+                                pages_closed=pages_closed
+                            )
+                        else:
+                            logging.warning(f"Session {session_id}: Browser disconnected, skipping context close")
+                            log_session_event(
+                                session_id, 
+                                'WARNING', 
+                                'Browser disconnected during cleanup, skipping context close',
+                                username=username,
+                                stage='cleanup_skip'
+                            )
+                    except Exception as e:
+                        logging.warning(f"Session {session_id}: Error checking/closing context: {e}")
                 else:
                     logging.debug(f"Session {session_id}: Browser not connected, skipping context cleanup")
                     log_session_event(
@@ -2387,7 +2930,9 @@ async def stress_test(browser, users):
     logging.info(f"Architecture: Each user logs in from {sessions_per_user} separate browser windows")
     logging.info(f"           → All {total_concurrent_sessions} windows chat concurrently")
     logging.info(f"           → Each window asks questions independently")
-    logging.info(f"Max concurrent contexts (semaphore limit): {context_semaphore._value}")
+    # Safely get semaphore value for logging
+    semaphore_value = context_semaphore._value if hasattr(context_semaphore, '_value') else 'unknown'
+    logging.info(f"Max concurrent contexts (semaphore limit): {semaphore_value}")
     logging.info("=" * 80)
     
     # Create all sessions concurrently - each session will ask ALL its questions
@@ -2395,9 +2940,29 @@ async def stress_test(browser, users):
     tasks = []
     session_id_counter = 0
     task_creation_order = []
+    user_task_counts = {}  # Track how many tasks per user
+    
+    # #region agent log
+    debug_log("H2", f"stress_test:{2487}", "Starting task creation loop", {
+        "total_users": len(users),
+        "sessions_per_user": sessions_per_user,
+        "expected_total_tasks": len(users) * sessions_per_user
+    })
+    # #endregion
     
     for user_index, user in enumerate(users):
         user_questions = user.get('questions', [])
+        username = user.get('username', 'Unknown')
+        user_task_counts[user_index] = 0
+        
+        # #region agent log
+        debug_log("H2", f"stress_test:{2493}", "Processing user in task creation", {
+            "user_index": user_index,
+            "username": username,
+            "sessions_per_user": sessions_per_user,
+            "tasks_created_so_far": len(tasks)
+        })
+        # #endregion
         
         # Create multiple browser windows (sessions) for this user
         # Each window is a separate browser context, allowing concurrent chatting
@@ -2412,11 +2977,12 @@ async def stress_test(browser, users):
                 "session_idx": session_idx,
                 "task_number": len(tasks),
                 "total_tasks_so_far": len(tasks),
-                "username": user['username']
+                "username": username,
+                "user_tasks_created": user_task_counts[user_index]
             }, session_id=session_id)
             # #endregion
             
-            logging.info(f"Creating session: {session_id} for user {user['username']} "
+            logging.info(f"Creating session: {session_id} for user {username} "
                         f"(Session {session_idx+1} of {sessions_per_user} for this user)")
             
             # Each session gets its own browser window and will ask all questions concurrently
@@ -2432,61 +2998,41 @@ async def stress_test(browser, users):
             )
             tasks.append(task)
             task_creation_order.append(session_id)
+            user_task_counts[user_index] += 1
             
             # #region agent log
             debug_log("H3", f"stress_test:{2292}", "Task created and appended", {
                 "session_id": session_id,
                 "task_number": len(tasks) - 1,
                 "total_tasks": len(tasks),
-                "creation_order": task_creation_order.copy()
+                "creation_order": task_creation_order.copy(),
+                "user_index": user_index,
+                "username": username,
+                "user_total_tasks": user_task_counts[user_index]
             }, session_id=session_id)
             # #endregion
+    
+    # #region agent log
+    debug_log("H2", f"stress_test:{2538}", "Task creation completed", {
+        "total_tasks_created": len(tasks),
+        "user_task_counts": user_task_counts,
+        "expected_total": len(users) * sessions_per_user
+    })
+    # #endregion
     
     if not tasks:
         logging.info("No sessions to create, exiting...")
         return
     
-    # FIX: Shuffle tasks to ensure fair distribution - prevents initial sessions from getting priority
-    # This randomizes the execution order so all sessions have equal opportunity
-    shuffle_enabled = STRESS_TEST_CONFIG.get('shuffle_tasks', True)
-    task_order_before_shuffle = task_creation_order.copy()
-    
-    if shuffle_enabled:
-        tasks_with_order = list(zip(tasks, task_creation_order))
-        random.shuffle(tasks_with_order)
-        tasks = [task for task, _ in tasks_with_order]
-        task_creation_order = [order for _, order in tasks_with_order]
-        
-        # #region agent log
-        debug_log("H3", f"stress_test:{2460}", "Tasks shuffled for fair distribution", {
-            "total_tasks": len(tasks),
-            "task_order_before": task_order_before_shuffle,
-            "task_order_after": task_creation_order.copy(),
-            "shuffled": True
-        })
-        # #endregion
-        
-        logging.info(f"\nStarting {len(tasks)} concurrent sessions (shuffled for fair distribution)...")
-        logging.info(f"Task execution order has been randomized to ensure equal priority for all sessions")
-    else:
-        # #region agent log
-        debug_log("H3", f"stress_test:{2460}", "Tasks NOT shuffled (shuffle_tasks=False)", {
-            "total_tasks": len(tasks),
-            "task_order": task_creation_order.copy(),
-            "shuffled": False
-        })
-        # #endregion
-        
-        logging.info(f"\nStarting {len(tasks)} concurrent sessions...")
-        logging.info(f"Note: Task shuffling is disabled - tasks will execute in creation order")
+    # Run all sessions concurrently (each opens its own browser window and asks all questions)
+    logging.info(f"\nStarting {len(tasks)} concurrent sessions - all questions will be asked concurrently...")
     
     # #region agent log
     debug_log("H3", f"stress_test:{2298}", "About to start asyncio.gather", {
         "total_tasks": len(tasks),
         "task_order": task_creation_order.copy(),
         "semaphore_limit": semaphore_limit,
-        "semaphore_available": context_semaphore._value if hasattr(context_semaphore, '_value') else 'unknown',
-        "shuffled": True
+        "semaphore_available": context_semaphore._value if hasattr(context_semaphore, '_value') else 'unknown'
     })
     # #endregion
     
@@ -2503,14 +3049,46 @@ async def stress_test(browser, users):
         logging.info(f"Each session will ask all its questions sequentially within its own browser window")
     
     gather_start_time = time.time()
+    
+    # #region agent log
+    debug_log("H4", f"stress_test:{2559}", "asyncio.gather starting execution", {
+        "total_tasks": len(tasks),
+        "task_creation_order": task_creation_order.copy(),
+        "user_task_counts": user_task_counts
+    })
+    # #endregion
+    
     results = await asyncio.gather(*tasks, return_exceptions=True)
     gather_end_time = time.time()
+    
+    # Analyze which users actually executed
+    user_execution_status = {}
+    for i, result in enumerate(results):
+        if i < len(task_creation_order):
+            session_id = task_creation_order[i]
+            try:
+                user_part = session_id.split("_")[0]  # "User1", "User2", etc.
+                user_idx = int(user_part.replace("User", "")) - 1
+                if user_idx not in user_execution_status:
+                    user_execution_status[user_idx] = {"success": 0, "failed": 0, "exceptions": 0}
+                if isinstance(result, Exception):
+                    user_execution_status[user_idx]["exceptions"] += 1
+                elif isinstance(result, dict):
+                    if result.get('success', False):
+                        user_execution_status[user_idx]["success"] += 1
+                    else:
+                        user_execution_status[user_idx]["failed"] += 1
+                else:
+                    user_execution_status[user_idx]["success"] += 1
+            except:
+                pass
     
     # #region agent log
     debug_log("H3", f"stress_test:{2310}", "asyncio.gather completed", {
         "total_tasks": len(tasks),
         "gather_duration_ms": (gather_end_time - gather_start_time) * 1000,
-        "results_count": len(results)
+        "results_count": len(results),
+        "user_execution_status": user_execution_status
     })
     # #endregion
     
