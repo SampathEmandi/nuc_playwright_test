@@ -1473,14 +1473,16 @@ async def interact_with_chatbot(page, tab_name, questions=None, session_id=None,
                         if question_num < len(questions_to_use):
                             # Check if rapid fire mode is enabled for WebSocket stress
                             if STRESS_TEST_CONFIG.get('websocket_rapid_fire', False):
-                                # Minimal delay - just enough for UI to be ready
-                                delay = 0.5
-                                logging.info(f"[{tab_name}] Rapid fire mode - minimal delay ({delay}s) before next question...")
+                                # NO DELAY - Maximum performance mode
+                                delay = 0
+                                logging.info(f"[{tab_name}] Rapid fire mode - NO DELAY - maximum performance...")
                             else:
                                 # Use configured delay
-                                delay = STRESS_TEST_CONFIG.get('delay_between_questions', 3)
-                                logging.info(f"[{tab_name}] Waiting {delay}s before next question...")
-                            await asyncio.sleep(delay)
+                                delay = STRESS_TEST_CONFIG.get('delay_between_questions', 0)
+                                if delay > 0:
+                                    logging.info(f"[{tab_name}] Waiting {delay}s before next question...")
+                            if delay > 0:
+                                await asyncio.sleep(delay)
             
                 # After completing all questions in cycle (both concurrent and sequential modes)
                 if continuous_mode:
@@ -1489,8 +1491,11 @@ async def interact_with_chatbot(page, tab_name, questions=None, session_id=None,
                         logging.info(f"[{tab_name}] Completed {cycle_count} cycles (requested: {continuous_iterations}), stopping continuous mode")
                         break
                     else:
-                        logging.info(f"[{tab_name}] Completed cycle {cycle_count}, waiting {cycle_delay}s before next cycle...")
-                        await asyncio.sleep(cycle_delay)
+                        if cycle_delay > 0:
+                            logging.info(f"[{tab_name}] Completed cycle {cycle_count}, waiting {cycle_delay}s before next cycle...")
+                            await asyncio.sleep(cycle_delay)
+                        else:
+                            logging.info(f"[{tab_name}] Completed cycle {cycle_count}, NO DELAY - starting next cycle immediately (maximum performance)...")
                         # Shuffle questions for next cycle to add variety
                         random.shuffle(questions_to_use)
                         logging.info(f"[{tab_name}] Starting next cycle with shuffled questions")
@@ -1509,8 +1514,11 @@ async def interact_with_chatbot(page, tab_name, questions=None, session_id=None,
                         logging.warning(f"[{tab_name}] Error occurred but reached max iterations, stopping")
                         break
                     else:
-                        logging.warning(f"[{tab_name}] Error in cycle, waiting {cycle_delay}s before retrying...")
-                        await asyncio.sleep(cycle_delay)
+                        if cycle_delay > 0:
+                            logging.warning(f"[{tab_name}] Error in cycle, waiting {cycle_delay}s before retrying...")
+                            await asyncio.sleep(cycle_delay)
+                        else:
+                            logging.warning(f"[{tab_name}] Error in cycle, NO DELAY - retrying immediately (maximum performance)...")
                         # Continue to next cycle instead of breaking
                         continue
                 else:

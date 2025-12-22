@@ -8,21 +8,21 @@ Configuration constants for the Playwright stress test application.
 STRESS_TEST_CONFIG = {
     'enabled': True,  # Set to False for normal single session mode
     'sessions_per_user': 10,  # Number of concurrent browser windows per user (each user logs in multiple times) - Can be calculated dynamically
-    'delay_between_questions': 3,  # Seconds to wait between questions within a session
+    'delay_between_questions': 0,  # NO DELAY - Maximum performance mode (was 3 seconds)
     'handle_both_courses': True,  # Set to False to open only one course per session
     # 'course_for_questions': 1,  # Which course to open (1 or 2) - only used if handle_both_courses is False
     'max_concurrent_contexts': 10000,  # Maximum number of concurrent browser contexts (windows) across all users - Can be calculated dynamically
     'dynamic_resource_calculation': True,  # If True, calculate sessions_per_user and max_concurrent_contexts based on available resources
     # WebSocket Stress Configuration
-    'websocket_stress_mode': False,  # Enable aggressive WebSocket stress testing
-    'websocket_rapid_fire': False,  # Send questions as fast as possible (minimal delays)
+    'websocket_stress_mode': True,  # Enable aggressive WebSocket stress testing - MAXIMUM PERFORMANCE
+    'websocket_rapid_fire': True,  # Send questions as fast as possible (NO delays) - MAXIMUM PERFORMANCE
     'websocket_keep_alive': True,  # Keep WebSocket connections open longer
     # Continuous Conversation Configuration
     'continuous_mode': True,  # Keep conversations active continuously (loop through questions)
     'continuous_iterations': None,  # Number of question cycles to run (None = infinite until stopped)
-    'continuous_cycle_delay': 5,  # Seconds to wait between question cycles (after all questions in cycle are asked)
+    'continuous_cycle_delay': 0,  # NO DELAY between cycles - Maximum performance mode (was 5 seconds)
     'maintain_concurrent': True,  # Maintain all conversations concurrently (don't wait for one to finish)
-    'concurrent_questions': True,  # Ask all questions concurrently (rapid-fire mode) for maximum stress
+    'concurrent_questions': True,  # Ask all questions concurrently within each session - each question still waits for its own response
     # CSV Export Configuration
     'incremental_csv_export': True,  # Write CSV logs periodically during execution (not just at end)
     'csv_export_interval': 300,  # Seconds between incremental CSV exports (default: 5 minutes)
