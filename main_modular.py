@@ -26,7 +26,7 @@ async def main():
     async with async_playwright() as p:
         # Create browser - NOT headless to ensure all windows are visible for monitoring
         browser = await p.chromium.launch(
-            headless=False,  # Always visible for monitoring and debugging
+            headless=True,  # Always visible for monitoring and debugging
             args=['--start-maximized']  # Start maximized for better visibility
         )
         
