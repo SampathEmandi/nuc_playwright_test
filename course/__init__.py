@@ -1,0 +1,1 @@
+"""Course handling modules for the Playwright stress test application."""

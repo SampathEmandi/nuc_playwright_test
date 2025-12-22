@@ -1,0 +1,1 @@
+"""Browser utilities for the Playwright stress test application."""

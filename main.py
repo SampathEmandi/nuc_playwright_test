@@ -10,6 +10,18 @@ import os
 import json
 from concurrent.futures import ThreadPoolExecutor
 import threading
+from browser.page_monitoring import setup_network_monitoring
+
+from utils.config_optimizer import update_stress_test_config
+from config import (
+    STRESS_TEST_CONFIG,
+    USERS,
+    QUESTION_CONFIG,
+    QUESTION_POOL,
+    course_1_questions,
+    course_2_questions,
+    general_questions
+)
 
 # Debug logging path is determined dynamically relative to the script's location, inside a '.cursor' folder
 DEBUG_LOG_PATH = str(Path(__file__).parent / ".cursor" / "debug.log")
@@ -104,125 +116,9 @@ THREAD_POOL = ThreadPoolExecutor(max_workers=20, thread_name_prefix="playwright_
 # Lock for thread-safe operations
 CSV_LOCK = threading.Lock()
 
-# ============================================================================
-# STRESS TEST CONFIGURATION
-# ============================================================================
-STRESS_TEST_CONFIG = {
-    'enabled': True,  # Set to False for normal single session mode
-    'sessions_per_user': 10,  # Number of concurrent browser windows per user (each user logs in multiple times)
-    'delay_between_questions': 3,  # Seconds to wait between questions within a session
-    'handle_both_courses': True,  # Set to False to open only one course per session
-    # 'course_for_questions': 1,  # Which course to open (1 or 2) - only used if handle_both_courses is False
-    'max_concurrent_contexts': 10000,  # Maximum number of concurrent browser contexts (windows) across all users - Set very high to effectively remove limit
-    # WebSocket Stress Configuration
-    'websocket_stress_mode': False,  # Enable aggressive WebSocket stress testing
-    'websocket_rapid_fire': False,  # Send questions as fast as possible (minimal delays)
-    'websocket_keep_alive': True,  # Keep WebSocket connections open longer
-    # Continuous Conversation Configuration
-    'continuous_mode': True,  # Keep conversations active continuously (loop through questions)
-    'continuous_iterations': None,  # Number of question cycles to run (None = infinite until stopped)
-    'continuous_cycle_delay': 5,  # Seconds to wait between question cycles (after all questions in cycle are asked)
-    'maintain_concurrent': True,  # Maintain all conversations concurrently (don't wait for one to finish)
-    'concurrent_questions': True,  # Ask all questions concurrently (rapid-fire mode) for maximum stress
-    # CSV Export Configuration
-    'incremental_csv_export': True,  # Write CSV logs periodically during execution (not just at end)
-    'csv_export_interval': 300,  # Seconds between incremental CSV exports (default: 5 minutes)
-    # Network Monitoring Configuration
-    'enable_network_monitoring': True,  # Enable network monitoring for all users (WebSocket and API tracking)
-    'monitor_all_users': True,  # Monitor network traffic for all users (not just first 1-2)
-    # Example: 5 users × 10 sessions = 50 concurrent browser windows, each handling one course
-}
-
-# ============================================================================
-# QUESTION POOL - Questions will be randomly assigned based on course
-# ============================================================================
-course_1_questions = [
-    "How does understanding normal anatomy and physiology help in identifying disease or illness?",
-    "Why is it helpful to learn medical terms when studying body systems?",
-    "What is meant by 'organization of the human body' in this course?",
-    "Which body system includes the skin, hair, and nails, and what is one key function of it?",
-    "What types of bones make up the skeletal system, and how are they classified?",
-    "How do muscles and bones work together to produce body movement?",
-    "What is the basic function of neurons in the nervous system?",
-    "What is the role of the brain and spinal cord within the nervous system?",
-    "What kinds of career paths might use knowledge from this anatomy and physiology course?",
-    "How are quizzes and exams used in this course to check your understanding of each module?",
-]
-
-course_2_questions = [
-"What is the required textbook for the Introduction to Business (BUMA1000) course?", 
-"Which textbook chapters are assigned in Module 1: Fundamentos de los negocios?",
-"What are the three main grade categories and their percentage weights in this course?",      
-"Name two ProQuest databases recommended for Module 2 assignments?",  
-"Which external resources are suggested for Module 3: Negocios globales?",  
-"What is the main focus of Module 4: Fundamentos de gerencia and which textbook chapter supports it?",  
-"What are the four management functions mentioned in the course materials?",  
-"What is the purpose of the Preprueba and does it affect the final grade?",  
-"What is a business plan, and why is it important for entrepreneurs and investors?",  
-"What is one key difference between entrepreneurship and management according to the transcript?",
-]
-
-general_questions = [
-    "Hi, please explain the course description",
-    "explain what this course is about",
-    "What are the modules of this course?",
-    "What topics will I learn in this course?",
-    "How is this course structured?",
-    "What are the learning objectives?",
-    "Can you explain the course content?",
-    "What should I expect from this course?",
-    "Tell me about the course syllabus",
-    "What will I study in this course?",
-]
-
-# Combined pool with all questions (fallback)
-QUESTION_POOL = course_1_questions + course_2_questions + general_questions
-
-# Configuration for question handling
-QUESTION_CONFIG = {
-    'questions_per_session': None,  # None = ask all questions, or set a number to limit
-    'min_response_wait': 5,  # Minimum seconds to wait for response
-    'max_response_wait': 30,  # Maximum seconds to wait for response
-    'response_check_interval': 2,  # Check every N seconds if response appeared
-}
-
-# ============================================================================
-# USER CREDENTIALS AND QUESTIONS - Each user has their own list of questions
-# ============================================================================
-USERS = [
-
-    {
-        'username': 'ctalluri@bay6.ai',
-        'password': 'devBay62025##',
-        # All course 1 questions go to course 1, all course 2 to course 2, general to both
-        'questions': course_1_questions + course_2_questions + general_questions,
-    },
-        {
-        'username': 'babug@bay6.ai',
-        'password': 'devBay62025##',
-        # All course 1 questions go to course 1, all course 2 to course 2, general to both
-        'questions': course_1_questions + course_2_questions + general_questions,
-    },
-    {
-        'username': 'deepk@bay6.ai',
-        'password': 'devBay62025##',
-        # All course 1 questions go to course 1, all course 2 to course 2, general to both
-        'questions': course_1_questions + course_2_questions + general_questions,
-    },
-        {
-        'username': 'samuelp@bay6.ai',
-        'password': 'devBay62025##',
-        # All course 1 questions go to course 1, all course 2 to course 2, general to both
-        'questions': course_1_questions + course_2_questions + general_questions,
-    },
-    {
-        'username': 'jasleenk@bay6.ai',
-        'password': 'devBay62025##',
-        # All course 1 questions go to course 1, all course 2 to course 2, general to both
-        'questions': course_1_questions + course_2_questions + general_questions,
-    },
-
-]
+from utils.config_optimizer import update_stress_test_config
+# Configuration is imported from config.py to avoid duplication
+# All configuration (STRESS_TEST_CONFIG, USERS, QUESTION_CONFIG, etc.) is now centralized in config.py
 
 # ============================================================================
 
@@ -692,112 +588,6 @@ async def open_course(context, course_number, tab_name, session_id=None, usernam
     except Exception as e:
         logging.error(f"✗ Error opening course {course_number} in {tab_name}: {e}")
         raise
-
-def setup_network_monitoring(page, tab_name, session_id=None, username=None):
-    """Setup network monitoring for WebSocket and API calls.
-    
-    Args:
-        page: Page object to monitor
-        tab_name: Name of the tab/course for logging
-        session_id: Optional session identifier for logging
-        username: Optional username for logging
-    """
-    # Check if network monitoring is enabled
-    if not STRESS_TEST_CONFIG.get('enable_network_monitoring', True):
-        logging.info(f"[{tab_name}] Network monitoring is disabled in configuration")
-        return [], [], {}
-    
-    # Check if we should monitor all users or just first few
-    monitor_all = STRESS_TEST_CONFIG.get('monitor_all_users', True)
-    if not monitor_all:
-        logging.warning(f"[{tab_name}] Network monitoring limited to first users (monitor_all_users=False)")
-        return [], [], {}
-    
-    websocket_requests = []
-    api_requests = []
-    websocket_timings = {}
-    
-    # Create log prefix with session and user info
-    if session_id and username:
-        log_prefix = f"[{session_id}] [{username}] [{tab_name}]"
-    elif session_id:
-        log_prefix = f"[{session_id}] [{tab_name}]"
-    elif username:
-        log_prefix = f"[{username}] [{tab_name}]"
-    else:
-        log_prefix = f"[{tab_name}]"
-    
-    def handle_request(request):
-        url = request.url
-        request_time = time.time()
-        
-        if 'chatbot_websocket' in url or 'websocket' in url.lower():
-            websocket_requests.append({
-                'url': url,
-                'method': request.method,
-                'timestamp': request_time,
-                'headers': dict(request.headers)
-            })
-            websocket_timings[url] = {'request_start': request_time}
-            logging.info(f"{log_prefix} [NETWORK] WebSocket Request: {url}")
-            logging.debug(f"{log_prefix} [NETWORK]   Headers: {dict(request.headers)}")
-        elif 'nucaiapi' in url or 'nucapi' in url:
-            api_requests.append({
-                'url': url,
-                'method': request.method,
-                'timestamp': request_time
-            })
-            logging.info(f"{log_prefix} [NETWORK] API Request: {url} - Method: {request.method}")
-    
-    def handle_response(response):
-        url = response.url
-        response_time = time.time()
-        status = response.status
-        
-        # Log HTTP error responses (4xx, 5xx)
-        if status >= 400:
-            if status >= 500:
-                logging.error(f"{log_prefix} [NETWORK] [HTTP ERROR] {status} {url}")
-            elif status == 404:
-                logging.warning(f"{log_prefix} [NETWORK] [HTTP 404] Not Found: {url}")
-            elif status == 403:
-                logging.warning(f"{log_prefix} [NETWORK] [HTTP 403] Forbidden: {url}")
-            elif status == 401:
-                logging.warning(f"{log_prefix} [NETWORK] [HTTP 401] Unauthorized: {url}")
-            else:
-                logging.warning(f"{log_prefix} [NETWORK] [HTTP {status}] {url}")
-        
-        try:
-            if 'chatbot_websocket' in url or 'websocket' in url.lower():
-                if url in websocket_timings:
-                    websocket_timings[url]['response_time'] = response_time
-                    connection_time = (response_time - websocket_timings[url]['request_start']) * 1000
-                    logging.info(f"{log_prefix} [NETWORK] WebSocket Connected: {url}")
-                    logging.info(f"{log_prefix} [NETWORK]   Connection Time: {connection_time:.2f}ms")
-                    logging.info(f"{log_prefix} [NETWORK]   Status: {response.status}")
-            elif 'nucaiapi' in url or 'nucapi' in url:
-                timing = response.request.timing
-                response_time_ms = timing.get('responseEnd', 0) - timing.get('requestStart', 0)
-                logging.info(f"{log_prefix} [NETWORK] API Response: {url}")
-                logging.info(f"{log_prefix} [NETWORK]   Status: {response.status}")
-                logging.info(f"{log_prefix} [NETWORK]   Response Time: {response_time_ms:.2f}ms")
-                if timing.get('responseStart', 0) > 0:
-                    ttfb = timing.get('responseStart', 0) - timing.get('requestStart', 0)
-                    logging.info(f"{log_prefix} [NETWORK]   Time to First Byte (TTFB): {ttfb:.2f}ms")
-        except Exception as e:
-            logging.debug(f"{log_prefix} [NETWORK] Error handling response: {e}")
-    
-    # Set up event listeners
-    try:
-        page.on('request', handle_request)
-        page.on('response', handle_response)
-        logging.info(f"{log_prefix} [NETWORK] Network monitoring enabled successfully")
-    except Exception as e:
-        logging.error(f"{log_prefix} [NETWORK] Failed to setup network monitoring: {e}")
-        import traceback
-        logging.error(traceback.format_exc())
-    
-    return websocket_requests, api_requests, websocket_timings
 
 def setup_page_error_logging(page, tab_name, session_id=None, username=None):
     """Setup logging for console messages, page errors, and failed requests.
@@ -1801,7 +1591,7 @@ async def run_user_session(context, user, questions=None, handle_both_courses=Tr
             if len(parts) > 0:
                 user_part = parts[0]  # "User1", "User2", etc.
                 user_index_from_session = int(user_part.replace("User", "")) - 1  # Convert to 0-based
-    except:
+    except (ValueError, AttributeError, IndexError):
         pass
     
     # #region agent log
@@ -2611,7 +2401,7 @@ async def run_session_with_context(browser, user, session_id, questions=None, qu
             if len(parts) > 0:
                 user_part = parts[0]  # "User1", "User2", etc.
                 user_index_from_session = int(user_part.replace("User", "")) - 1  # Convert to 0-based
-    except:
+    except (ValueError, AttributeError, IndexError):
         pass
     
         # Acquire semaphore only for creating browser context (limit concurrent context creation)
@@ -3386,10 +3176,14 @@ def write_csv_report(append_mode=False):
 
 async def stress_test(browser, users):
     """Run stress test where all sessions ask questions concurrently across multiple browser windows."""
+    # Calculate optimal configuration based on resources
+    if STRESS_TEST_CONFIG.get('dynamic_resource_calculation', True):
+        update_stress_test_config(dynamic_mode=True)
+    
     all_session_metrics = []
     stress_test_start = time.time()
     
-    # Get configuration
+    # Get configuration (values are now optimized and stored in STRESS_TEST_CONFIG)
     sessions_per_user = STRESS_TEST_CONFIG.get('sessions_per_user', 1)
     delay_between_questions = STRESS_TEST_CONFIG.get('delay_between_questions', 2)
     handle_both_courses = STRESS_TEST_CONFIG.get('handle_both_courses', True)
