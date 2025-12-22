@@ -3178,7 +3178,11 @@ async def stress_test(browser, users):
     """Run stress test where all sessions ask questions concurrently across multiple browser windows."""
     # Calculate optimal configuration based on resources
     if STRESS_TEST_CONFIG.get('dynamic_resource_calculation', True):
-        update_stress_test_config(dynamic_mode=True)
+        # Force maximum contexts - override to use hard limit
+        update_stress_test_config(
+            dynamic_mode=True,
+            override_max_contexts=10000  # Force maximum hard limit
+        )
     
     all_session_metrics = []
     stress_test_start = time.time()
