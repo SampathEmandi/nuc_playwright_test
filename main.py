@@ -1418,6 +1418,81 @@ async def interact_with_chatbot(page, tab_name, questions=None, session_id=None,
         if concurrent_questions:
             logging.info(f"[{tab_name}] ⚡ CONCURRENT QUESTIONS MODE ENABLED - All questions will be asked simultaneously")
         
+        # PIPELINE MODE for constant load: In continuous mode with concurrent questions, use pipeline approach
+        if concurrent_questions and continuous_mode:
+            # CONTINUOUS PIPELINE: Maintain constant load by continuously processing questions
+            # As soon as one question completes, start the next one immediately
+            logging.info(f"[{tab_name}] 🚀 Starting continuous pipeline mode - maintaining CONSTANT load...")
+            
+            question_counter = {'value': 0}  # Use dict to allow modification in nested function
+            question_pool = questions_to_use.copy()
+            total_questions_processed = {'value': 0}
+            should_continue = {'value': True}
+            counter_lock = asyncio.Lock()
+            
+            async def process_question_pipeline():
+                while should_continue['value']:
+                    # Get next question atomically
+                    async with counter_lock:
+                        # Check iteration limit
+                        if continuous_iterations and total_questions_processed['value'] >= continuous_iterations * len(question_pool):
+                            should_continue['value'] = False
+                            break
+                        
+                        # Get next question from pool (cycle through)
+                        question_idx = question_counter['value'] % len(question_pool)
+                        question = question_pool[question_idx]
+                        question_counter['value'] += 1
+                        question_num = question_counter['value']
+                        total_questions_processed['value'] += 1
+                        
+                        # Shuffle pool periodically for variety (every full cycle)
+                        if question_counter['value'] % len(question_pool) == 0:
+                            random.shuffle(question_pool)
+                            logging.debug(f"[{tab_name}] Shuffled question pool after {question_counter['value']} questions")
+                    
+                    # Process question outside lock to allow concurrent processing
+                    try:
+                        metric = await ask_single_question(
+                            page, iframe, tab_name, question, question_num,
+                            session_id=session_id, course_number=course_number,
+                            username=username, question_metrics=question_metrics
+                        )
+                        question_metrics.append(metric)
+                    
+                    except Exception as e:
+                        logging.error(f"[{tab_name}] Question {question_num} failed: {e}")
+                        question_metrics.append({
+                            'question_number': question_num,
+                            'question': question,
+                            'question_submit_time': 0,
+                            'response_wait_time': 0,
+                            'question_total_time': 0,
+                            'response_received': False,
+                            'error': str(e)
+                        })
+            
+            # Launch multiple pipeline workers to maintain constant load
+            # Each worker continuously processes questions - as one completes, it immediately starts the next
+            num_workers = min(len(questions_to_use), 10)  # Use multiple workers to maintain constant load
+            logging.info(f"[{tab_name}] Launching {num_workers} pipeline workers for constant load...")
+            
+            pipeline_tasks = [
+                process_question_pipeline() 
+                for _ in range(num_workers)
+            ]
+            
+            # Run pipeline continuously - this maintains constant load
+            try:
+                await asyncio.gather(*pipeline_tasks, return_exceptions=True)
+            except Exception as e:
+                logging.error(f"[{tab_name}] Pipeline error: {e}")
+                should_continue['value'] = False
+            
+            logging.info(f"[{tab_name}] Pipeline completed - processed {total_questions_processed['value']} questions")
+            return  # Exit function - pipeline handled everything
+        
+        # STANDARD MODE: Original cycle-based approach for non-continuous or non-concurrent modes
         while True:
             try:
                 cycle_count += 1
@@ -1425,7 +1500,7 @@ async def interact_with_chatbot(page, tab_name, questions=None, session_id=None,
                     logging.info(f"[{tab_name}] ========== Starting Question Cycle {cycle_count} ==========")
                 
                 if concurrent_questions:
-                    # CONCURRENT MODE: Ask all questions simultaneously
+                    # CONCURRENT MODE: Ask all questions simultaneously (single cycle)
                     logging.info(f"[{tab_name}] 🚀 Launching {len(questions_to_use)} questions concurrently...")
                     question_tasks = []
                     for question_num, question in enumerate(questions_to_use, 1):
