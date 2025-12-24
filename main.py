@@ -1,18 +1,21 @@
-from playwright.async_api import async_playwright
+# Standard library imports
 import asyncio
-from pathlib import Path
-import logging
-import time
-import random
-from datetime import datetime
 import csv
-import os
 import json
-from concurrent.futures import ThreadPoolExecutor
+import logging
+import os
+import random
 import threading
-from browser.page_monitoring import setup_network_monitoring
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from pathlib import Path
 
-from utils.config_optimizer import update_stress_test_config
+# Third-party imports
+from playwright.async_api import async_playwright
+
+# Local imports
+from browser.page_monitoring import setup_network_monitoring
 from config import (
     STRESS_TEST_CONFIG,
     USERS,
@@ -22,6 +25,7 @@ from config import (
     course_2_questions,
     general_questions
 )
+from utils.config_optimizer import update_stress_test_config
 
 # Debug logging path is determined dynamically relative to the script's location, inside a '.cursor' folder
 DEBUG_LOG_PATH = str(Path(__file__).parent / ".cursor" / "debug.log")
@@ -93,7 +97,22 @@ def setup_logging():
 
 # Setup logging at startup
 LOG_FILENAME = setup_logging()
-logging.info(f"Logging initialized - Log file: {LOG_FILENAME}")
+
+# Import structured logger after setup
+from utils.structured_logger import (
+    get_logger,
+    log_websocket,
+    log_login,
+    log_question,
+    log_response,
+    log_error,
+    LogCategory,
+    LogSource,
+    setup_structured_logging
+)
+
+# Setup structured logging
+LOG_FILENAME = setup_structured_logging(LOG_FILENAME)
 
 # Global list to store CSV metrics
 CSV_METRICS = []
@@ -116,10 +135,8 @@ THREAD_POOL = ThreadPoolExecutor(max_workers=20, thread_name_prefix="playwright_
 # Lock for thread-safe operations
 CSV_LOCK = threading.Lock()
 
-from utils.config_optimizer import update_stress_test_config
-# Configuration is imported from config.py to avoid duplication
-# All configuration (STRESS_TEST_CONFIG, USERS, QUESTION_CONFIG, etc.) is now centralized in config.py
-
+# ============================================================================
+# Helper Functions
 # ============================================================================
 
 async def get_iframe_content_frame(page, tab_name, max_attempts=5):
@@ -345,7 +362,6 @@ async def open_course(context, course_number, tab_name, session_id=None, usernam
         )
         monitoring_setup_time = (time.time() - monitoring_setup_start) * 1000
         
-        # #region agent log
         debug_log("H5", f"open_course:{307}", "Network monitoring setup completed", {
             "session_id": session_id,
             "username": username,
@@ -355,7 +371,6 @@ async def open_course(context, course_number, tab_name, session_id=None, usernam
             "monitoring_enabled": STRESS_TEST_CONFIG.get('enable_network_monitoring', True),
             "monitor_all_users": STRESS_TEST_CONFIG.get('monitor_all_users', True)
         }, session_id=session_id)
-        # #endregion
         
         # Verify monitoring is active
         if STRESS_TEST_CONFIG.get('enable_network_monitoring', True) and STRESS_TEST_CONFIG.get('monitor_all_users', True):
@@ -1128,7 +1143,7 @@ async def interact_with_chatbot(page, tab_name, questions=None, session_id=None,
         course_number: Course number (1 or 2) for CSV logging
         username: Username for logging
         continuous_mode: If True, continuously loop through questions
-        continuous_iterations: Number of cycles to run (None = infinite)
+        continuous_iterations: Number of cycles to run (None = run until stopped/infinite)
     """
     try:
         logging.info(f"Interacting with chatbot in {tab_name}...")
@@ -1677,7 +1692,6 @@ async def run_user_session(context, user, questions=None, handle_both_courses=Tr
     except (ValueError, AttributeError, IndexError):
         pass
     
-    # #region agent log
     debug_log("H4", f"run_user_session:{1471}", "User session function entry - H4: Browser disconnection", {
         "session_id": session_id,
         "username": username,
@@ -1686,7 +1700,6 @@ async def run_user_session(context, user, questions=None, handle_both_courses=Tr
         "user_index": user_index_from_session,
         "browser_connected": context.browser.is_connected() if context and context.browser else False
     }, session_id=session_id)
-    # #endregion
     
     # Handle both single question (backward compatibility) and list of questions
     if questions is None:
@@ -2931,6 +2944,12 @@ def write_session_logs_csv(append_mode=False):
     """
     global SESSION_CSV_EXPORT_FILENAME
     
+    # Check if CSV export is enabled
+    if not STRESS_TEST_CONFIG.get('enable_csv_export', True):
+        if not append_mode:
+            logging.info("[CAT:SYSTEM] [SRC:UTILS] CSV export disabled - skipping session logs CSV write")
+        return
+    
     # Get current working directory for absolute path
     cwd = os.getcwd()
     
@@ -3256,16 +3275,31 @@ def write_csv_report(append_mode=False):
     
     # Write session logs CSV in parallel
     write_session_logs_csv()
+    
+    # Write categorized error CSVs
+    try:
+        from reporting.categorized_csv_reporter import write_all_categorized_csvs
+        write_all_categorized_csvs(append_mode=append_mode)
+    except ImportError:
+        pass
+    except Exception as e:
+        logging.warning(f"Could not write categorized CSVs: {e}")
 
 async def stress_test(browser, users):
     """Run stress test where all sessions ask questions concurrently across multiple browser windows."""
-    # Calculate optimal configuration based on resources
-    if STRESS_TEST_CONFIG.get('dynamic_resource_calculation', True):
-        # Force maximum contexts - override to use hard limit
+    # Resource calculation is disabled by default - use config values directly
+    # If dynamic_resource_calculation is True, calculate optimal configuration based on resources
+    if STRESS_TEST_CONFIG.get('dynamic_resource_calculation', False):
+        # Use dynamic calculation - no hard limit
+        # If max_concurrent_contexts is set in config, use that; otherwise calculate based on resources
+        max_contexts_override = STRESS_TEST_CONFIG.get('max_concurrent_contexts')
         update_stress_test_config(
             dynamic_mode=True,
-            override_max_contexts=10000  # Force maximum hard limit
+            override_max_contexts=max_contexts_override  # Use config value or None for unlimited
         )
+    else:
+        # Resource calculation disabled - use config values as-is
+        logging.info("Resource calculation disabled - using config values directly")
     
     all_session_metrics = []
     stress_test_start = time.time()
@@ -3274,6 +3308,9 @@ async def stress_test(browser, users):
     sessions_per_user = STRESS_TEST_CONFIG.get('sessions_per_user', 1)
     delay_between_questions = STRESS_TEST_CONFIG.get('delay_between_questions', 2)
     handle_both_courses = STRESS_TEST_CONFIG.get('handle_both_courses', True)
+    session_setup_delay = STRESS_TEST_CONFIG.get('session_setup_delay', 0)
+    session_batch_size = STRESS_TEST_CONFIG.get('session_batch_size', None)
+    session_batch_delay = STRESS_TEST_CONFIG.get('session_batch_delay', 0)
     
     # Calculate total concurrent sessions needed
     total_concurrent_sessions = len(users) * sessions_per_user
@@ -3309,6 +3346,19 @@ async def stress_test(browser, users):
     logging.info(f"Total Questions Across All Users: {total_questions}")
     logging.info(f"Handle Both Courses: {handle_both_courses}")
     logging.info(f"Continuous Mode: {continuous_mode}")
+    if session_setup_delay > 0:
+        logging.info(f"Session Setup Delay: {session_setup_delay}s between each session (staggered creation)")
+    else:
+        logging.info(f"Session Setup Delay: 0s (all sessions created immediately)")
+    
+    if session_batch_size and session_batch_size > 0:
+        total_sessions = len(users) * sessions_per_user
+        num_batches = (total_sessions + session_batch_size - 1) // session_batch_size
+        logging.info(f"Session Batching: Enabled - {total_sessions} sessions in {num_batches} batches (batch size: {session_batch_size})")
+        if session_batch_delay > 0:
+            logging.info(f"Batch Delay: {session_batch_delay}s between batches")
+    else:
+        logging.info(f"Session Batching: Disabled (all sessions created at once)")
     
     # Network Monitoring Configuration
     enable_monitoring = STRESS_TEST_CONFIG.get('enable_network_monitoring', True)
@@ -3356,25 +3406,106 @@ async def stress_test(browser, users):
     })
     # #endregion
     
+    # Prepare all session configurations first
+    session_configs = []
     for user_index, user in enumerate(users):
         user_questions = user.get('questions', [])
         username = user.get('username', 'Unknown')
         user_task_counts[user_index] = 0
         
-        # #region agent log
-        debug_log("H2", f"stress_test:{2493}", "Processing user in task creation", {
-            "user_index": user_index,
-            "username": username,
-            "sessions_per_user": sessions_per_user,
-            "tasks_created_so_far": len(tasks)
-        })
-        # #endregion
-        
-        # Create multiple browser windows (sessions) for this user
-        # Each window is a separate browser context, allowing concurrent chatting
         for session_idx in range(sessions_per_user):
             session_id_counter += 1
             session_id = f"User{user_index+1}_Session{session_idx+1}_{user['username']}"
+            session_configs.append({
+                'user_index': user_index,
+                'user': user,
+                'username': username,
+                'user_questions': user_questions,
+                'session_id': session_id,
+                'session_idx': session_idx
+            })
+    
+    # Create sessions in batches if batch_size is configured
+    if session_batch_size and session_batch_size > 0:
+        total_sessions = len(session_configs)
+        num_batches = (total_sessions + session_batch_size - 1) // session_batch_size  # Ceiling division
+        logging.info(f"Creating {total_sessions} sessions in {num_batches} batches (batch size: {session_batch_size})")
+        
+        for batch_num in range(num_batches):
+            batch_start = batch_num * session_batch_size
+            batch_end = min(batch_start + session_batch_size, total_sessions)
+            batch_configs = session_configs[batch_start:batch_end]
+            
+            logging.info(f"Creating batch {batch_num + 1}/{num_batches} ({len(batch_configs)} sessions)...")
+            
+            # Create sessions in this batch
+            for config in batch_configs:
+                user_index = config['user_index']
+                user = config['user']
+                username = config['username']
+                user_questions = config['user_questions']
+                session_id = config['session_id']
+                session_idx = config['session_idx']
+                
+                # #region agent log
+                debug_log("H1", f"stress_test:{2969}", "Task creation start - H1: Browser context limit", {
+                    "session_id": session_id,
+                    "user_index": user_index,
+                    "session_idx": session_idx,
+                    "task_number": len(tasks),
+                    "total_tasks_so_far": len(tasks),
+                    "username": username,
+                    "user_tasks_created": user_task_counts[user_index],
+                    "total_users": len(users),
+                    "current_user_number": user_index + 1,
+                    "batch_number": batch_num + 1,
+                    "batch_size": len(batch_configs)
+                }, session_id=session_id)
+                # #endregion
+                
+                logging.info(f"Creating session: {session_id} for user {username} "
+                            f"(Session {session_idx+1} of {sessions_per_user} for this user) [Batch {batch_num + 1}/{num_batches}]")
+                
+                task = run_session_with_context(
+                    browser, 
+                    user, 
+                    session_id, 
+                    questions=user_questions,
+                    handle_both_courses=handle_both_courses,
+                    semaphore=context_semaphore
+                )
+                tasks.append(task)
+                task_creation_order.append(session_id)
+                user_task_counts[user_index] += 1
+                
+                # Add delay between session setups within batch
+                if session_setup_delay > 0 and config != batch_configs[-1]:  # Don't delay after last in batch
+                    await asyncio.sleep(session_setup_delay)
+                    logging.debug(f"Session setup delay: waited {session_setup_delay}s before creating next session")
+            
+            # Wait between batches (except after the last batch)
+            if batch_num < num_batches - 1 and session_batch_delay > 0:
+                logging.info(f"Batch {batch_num + 1} completed. Waiting {session_batch_delay}s before next batch...")
+                await asyncio.sleep(session_batch_delay)
+    else:
+        # No batching - create all sessions at once (original behavior)
+        for config in session_configs:
+            user_index = config['user_index']
+            user = config['user']
+            username = config['username']
+            user_questions = config['user_questions']
+            session_id = config['session_id']
+            session_idx = config['session_idx']
+            user_task_counts[user_index] = 0
+            
+            # #region agent log
+            debug_log("H2", f"stress_test:{2493}", "Processing user in task creation", {
+                "user_index": user_index,
+                "username": username,
+                "sessions_per_user": sessions_per_user,
+                "tasks_created_so_far": len(tasks)
+            })
+            # #endregion
             
             # #region agent log
             debug_log("H1", f"stress_test:{2969}", "Task creation start - H1: Browser context limit", {
@@ -3390,28 +3521,14 @@ async def stress_test(browser, users):
             }, session_id=session_id)
             # #endregion
             
-            # #region agent log
-            debug_log("H2", f"stress_test:{2969}", "Task creation start - H2: Semaphore starvation", {
-                "session_id": session_id,
-                "user_index": user_index,
-                "semaphore_limit": semaphore_limit,
-                "semaphore_available": context_semaphore._value if hasattr(context_semaphore, '_value') else 'unknown',
-                "total_tasks_created": len(tasks),
-                "username": username
-            }, session_id=session_id)
-            # #endregion
-            
             logging.info(f"Creating session: {session_id} for user {username} "
                         f"(Session {session_idx+1} of {sessions_per_user} for this user)")
             
-            # Each session gets its own browser window and will ask all questions concurrently
-            # with other sessions from the same user and other users
-            # Each window will handle both Course 1 and Course 2 if handle_both_courses is True
             task = run_session_with_context(
                 browser, 
                 user, 
                 session_id, 
-                questions=user_questions,  # Pass all questions
+                questions=user_questions,
                 handle_both_courses=handle_both_courses,
                 semaphore=context_semaphore
             )
@@ -3419,17 +3536,13 @@ async def stress_test(browser, users):
             task_creation_order.append(session_id)
             user_task_counts[user_index] += 1
             
-            # #region agent log
-            debug_log("H3", f"stress_test:{2292}", "Task created and appended", {
-                "session_id": session_id,
-                "task_number": len(tasks) - 1,
-                "total_tasks": len(tasks),
-                "creation_order": task_creation_order.copy(),
-                "user_index": user_index,
-                "username": username,
-                "user_total_tasks": user_task_counts[user_index]
-            }, session_id=session_id)
-            # #endregion
+            # Add delay between session setups to stagger creation
+            if session_setup_delay > 0:
+                # Don't delay after the last session
+                is_last_session = config == session_configs[-1]
+                if not is_last_session:
+                    await asyncio.sleep(session_setup_delay)
+                    logging.debug(f"Session setup delay: waited {session_setup_delay}s before creating next session")
     
     # #region agent log
     debug_log("H1", f"stress_test:{3015}", "Task creation completed - H1: Browser context limit", {
@@ -3621,10 +3734,10 @@ async def main():
     """Main function."""
     
     async with async_playwright() as p:
-        # Create browser - NOT headless to ensure all windows are visible for monitoring
+        # Create browser
         browser = await p.chromium.launch(
-            headless=True,  # Always visible for monitoring and debugging
-            args=['--start-maximized']  # Start maximized for better visibility
+            headless=True,
+            args=['--start-maximized']
         )
         
         logging.info("Browser started")

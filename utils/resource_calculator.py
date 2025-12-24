@@ -25,7 +25,7 @@ class ResourceCalculator:
     MIN_SESSIONS_PER_USER = 1
     MAX_SESSIONS_PER_USER = 50
     MIN_CONCURRENT_CONTEXTS = 1
-    MAX_CONCURRENT_CONTEXTS = 10000
+    MAX_CONCURRENT_CONTEXTS = None  # No upper limit - use system resources as guide
     
     def __init__(self):
         """Initialize the resource calculator."""
@@ -123,8 +123,10 @@ class ResourceCalculator:
         max_contexts = min(max_contexts_memory, max_contexts_cpu)
         
         # Apply constraints
-        max_contexts = max(self.MIN_CONCURRENT_CONTEXTS, 
-                          min(max_contexts, self.MAX_CONCURRENT_CONTEXTS))
+        max_contexts = max(self.MIN_CONCURRENT_CONTEXTS, max_contexts)
+        # Apply upper limit only if MAX_CONCURRENT_CONTEXTS is set
+        if self.MAX_CONCURRENT_CONTEXTS is not None:
+            max_contexts = min(max_contexts, self.MAX_CONCURRENT_CONTEXTS)
         
         # Calculate sessions_per_user based on max contexts and number of users
         if num_users > 0:
