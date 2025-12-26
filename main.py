@@ -520,14 +520,34 @@ async def open_course(context, course_number, tab_name, session_id=None, usernam
         await asyncio.sleep(1)
         
         # Try multiple selectors for clicking the course link
-        course_link_selectors = [
-            f'#DashboardCard_Container > div > div > div:nth-child({course_number}) > div > a',
-            f'#DashboardCard_Container > div > div > div:nth-child({course_number}) > div > a > div',
-            f'#DashboardCard_Container div:nth-child({course_number}) > div > a',
-            f'a[href*="/courses/"]:nth-of-type({course_number})',
-            f'#DashboardCard_Container a[href*="/courses/"]:nth-child({course_number})',
-            f'#DashboardCard_Container a[href*="/courses/"]',  # Fallback: any course link
-        ]
+        # Use specific selectors for course 1 and course 2
+        if course_number == 1:
+            course_link_selectors = [
+                '#DashboardCard_Container > div > div > div:nth-child(1) > div > a',  # Specific selector for course 1
+                f'#DashboardCard_Container > div > div > div:nth-child({course_number}) > div > a > div',
+                f'#DashboardCard_Container div:nth-child({course_number}) > div > a',
+                f'a[href*="/courses/"]:nth-of-type({course_number})',
+                f'#DashboardCard_Container a[href*="/courses/"]:nth-child({course_number})',
+                f'#DashboardCard_Container a[href*="/courses/"]',  # Fallback: any course link
+            ]
+        elif course_number == 2:
+            course_link_selectors = [
+                '#DashboardCard_Container > div > div > div:nth-child(2) > div > a',  # Specific selector for course 2
+                f'#DashboardCard_Container > div > div > div:nth-child({course_number}) > div > a > div',
+                f'#DashboardCard_Container div:nth-child({course_number}) > div > a',
+                f'a[href*="/courses/"]:nth-of-type({course_number})',
+                f'#DashboardCard_Container a[href*="/courses/"]:nth-child({course_number})',
+                f'#DashboardCard_Container a[href*="/courses/"]',  # Fallback: any course link
+            ]
+        else:
+            course_link_selectors = [
+                f'#DashboardCard_Container > div > div > div:nth-child({course_number}) > div > a',
+                f'#DashboardCard_Container > div > div > div:nth-child({course_number}) > div > a > div',
+                f'#DashboardCard_Container div:nth-child({course_number}) > div > a',
+                f'a[href*="/courses/"]:nth-of-type({course_number})',
+                f'#DashboardCard_Container a[href*="/courses/"]:nth-child({course_number})',
+                f'#DashboardCard_Container a[href*="/courses/"]',  # Fallback: any course link
+            ]
         
         clicked = False
         last_error = None
@@ -1179,7 +1199,8 @@ async def interact_with_chatbot(page, tab_name, questions=None, session_id=None,
             try:
                 # Wait for visibility before each attempt
                 await chatbot_btn.wait_for(state='visible', timeout=30000)
-                await chatbot_btn.scroll_into_view_if_needed()
+                # Add explicit timeout to prevent negative timeout errors
+                await chatbot_btn.scroll_into_view_if_needed(timeout=30000)
                 
                 # #region agent log
                 debug_log("CHATBOT_CLICK", f"interact_with_chatbot:{1036}", "Chatbot button click attempt", {
@@ -3275,6 +3296,13 @@ async def stress_test(browser, users):
     delay_between_questions = STRESS_TEST_CONFIG.get('delay_between_questions', 2)
     handle_both_courses = STRESS_TEST_CONFIG.get('handle_both_courses', True)
     
+    # Get batch processing configuration
+    batch_config = STRESS_TEST_CONFIG.get('batch_processing', {})
+    batch_enabled = batch_config.get('enabled', False)
+    users_per_batch = batch_config.get('users_per_batch', len(users))
+    delay_between_batches = batch_config.get('delay_between_batches', 10)
+    wait_for_completion = batch_config.get('wait_for_completion', True)
+    
     # Calculate total concurrent sessions needed
     total_concurrent_sessions = len(users) * sessions_per_user
     
@@ -3310,6 +3338,21 @@ async def stress_test(browser, users):
     logging.info(f"Handle Both Courses: {handle_both_courses}")
     logging.info(f"Continuous Mode: {continuous_mode}")
     
+    # Log batch processing configuration
+    if batch_enabled:
+        total_batches = (len(users) + users_per_batch - 1) // users_per_batch
+        logging.info(f"Batch Processing: ENABLED")
+        logging.info(f"  → Users per batch: {users_per_batch}")
+        logging.info(f"  → Total batches: {total_batches}")
+        logging.info(f"  → Delay between batches: {delay_between_batches} seconds")
+        logging.info(f"  → Wait for completion: {wait_for_completion}")
+        if wait_for_completion:
+            logging.info(f"  → Batches will run sequentially (each completes before next starts)")
+        else:
+            logging.info(f"  → Batches will run concurrently (old batches keep running)")
+    else:
+        logging.info(f"Batch Processing: DISABLED (all users run concurrently)")
+    
     # Network Monitoring Configuration
     enable_monitoring = STRESS_TEST_CONFIG.get('enable_network_monitoring', True)
     monitor_all = STRESS_TEST_CONFIG.get('monitor_all_users', True)
@@ -3341,152 +3384,258 @@ async def stress_test(browser, users):
     logging.info(f"Max concurrent contexts (semaphore limit): {semaphore_value}")
     logging.info("=" * 80)
     
-    # Create all sessions concurrently - each session will ask ALL its questions
-    # Each user gets multiple browser windows (sessions_per_user), all running concurrently
+    # Initialize variables that will be used later (for both batch and non-batch modes)
     tasks = []
-    session_id_counter = 0
     task_creation_order = []
-    user_task_counts = {}  # Track how many tasks per user
+    gather_start_time = None
     
-    # #region agent log
-    debug_log("H2", f"stress_test:{2487}", "Starting task creation loop", {
-        "total_users": len(users),
-        "sessions_per_user": sessions_per_user,
-        "expected_total_tasks": len(users) * sessions_per_user
-    })
-    # #endregion
-    
-    for user_index, user in enumerate(users):
-        user_questions = user.get('questions', [])
-        username = user.get('username', 'Unknown')
-        user_task_counts[user_index] = 0
+    # Check if batch processing is enabled
+    if batch_enabled:
+        # Process users in batches
+        total_batches = (len(users) + users_per_batch - 1) // users_per_batch
+        all_batch_results = []
+        gather_start_time = time.time()  # Start timing for batch mode
+        
+        for batch_num in range(total_batches):
+            start_idx = batch_num * users_per_batch
+            end_idx = min(start_idx + users_per_batch, len(users))
+            batch_users = users[start_idx:end_idx]
+            batch_sessions = len(batch_users) * sessions_per_user
+            
+            logging.info("=" * 80)
+            logging.info(f"BATCH {batch_num + 1}/{total_batches}: Processing users {start_idx+1}-{end_idx}")
+            logging.info(f"Users in batch: {[u.get('username', 'Unknown') for u in batch_users]}")
+            logging.info(f"Sessions per user: {sessions_per_user}")
+            logging.info(f"Total sessions in batch: {batch_sessions}")
+            logging.info("=" * 80)
+            
+            # Create tasks for this batch
+            batch_tasks = []
+            session_id_counter = 0
+            batch_task_creation_order = []  # Local to this batch
+            user_task_counts = {}
+            
+            for batch_user_idx, user in enumerate(batch_users):
+                actual_user_index = start_idx + batch_user_idx
+                user_questions = user.get('questions', [])
+                username = user.get('username', 'Unknown')
+                user_task_counts[actual_user_index] = 0
+                
+                # Create multiple browser windows (sessions) for this user
+                for session_idx in range(sessions_per_user):
+                    session_id_counter += 1
+                    session_id = f"Batch{batch_num+1}_User{actual_user_index+1}_Session{session_idx+1}_{user['username']}"
+                    
+                    logging.info(f"Creating session: {session_id} for user {username} "
+                                f"(Session {session_idx+1} of {sessions_per_user} for this user)")
+                    
+                    task = run_session_with_context(
+                        browser, 
+                        user, 
+                        session_id, 
+                        questions=user_questions,
+                        handle_both_courses=handle_both_courses,
+                        semaphore=context_semaphore
+                    )
+                    batch_tasks.append(task)
+                    batch_task_creation_order.append(session_id)
+                    task_creation_order.append(session_id)  # Also add to global list for tracking
+                    tasks.append(task)  # Add to global tasks list for tracking
+                    user_task_counts[actual_user_index] += 1
+            
+            if not batch_tasks:
+                logging.warning(f"Batch {batch_num + 1} has no tasks, skipping...")
+                continue
+            
+            # Run batch
+            logging.info(f"\nStarting batch {batch_num + 1} with {len(batch_tasks)} concurrent sessions...")
+            batch_start_time = time.time()
+            
+            if wait_for_completion:
+                # Wait for batch to complete before starting next
+                batch_task_objects = [asyncio.create_task(task) for task in batch_tasks]
+                batch_results = await asyncio.gather(*batch_task_objects, return_exceptions=True)
+                batch_end_time = time.time()
+                batch_duration = batch_end_time - batch_start_time
+                
+                all_batch_results.extend(batch_results)
+                
+                logging.info(f"Batch {batch_num + 1} completed in {batch_duration:.2f} seconds")
+                
+                # Wait before next batch (except for last batch)
+                if batch_num < total_batches - 1:
+                    logging.info(f"Waiting {delay_between_batches} seconds before starting next batch...")
+                    await asyncio.sleep(delay_between_batches)
+            else:
+                # Start batch but don't wait - batches run concurrently
+                batch_task_objects = [asyncio.create_task(task) for task in batch_tasks]
+                all_batch_results.extend(batch_task_objects)
+                
+                logging.info(f"Batch {batch_num + 1} started (running concurrently with other batches)")
+                
+                # Wait before starting next batch (but don't wait for completion)
+                if batch_num < total_batches - 1:
+                    logging.info(f"Waiting {delay_between_batches} seconds before starting next batch...")
+                    await asyncio.sleep(delay_between_batches)
+        
+        # If batches were running concurrently, wait for all to complete
+        if not wait_for_completion:
+            logging.info(f"\nAll batches started. Waiting for all {len(all_batch_results)} sessions to complete...")
+            results = await asyncio.gather(*all_batch_results, return_exceptions=True)
+        else:
+            results = all_batch_results
+        
+        # Continue with results processing (same as non-batch mode)
+        gather_end_time = time.time()
+        gather_start_time = gather_start_time or time.time()  # Ensure it's set
+    else:
+        # Original behavior - all users at once (non-batch mode)
+        # Create all sessions concurrently - each session will ask ALL its questions
+        # Each user gets multiple browser windows (sessions_per_user), all running concurrently
+        tasks = []
+        session_id_counter = 0
+        task_creation_order = []
+        user_task_counts = {}  # Track how many tasks per user
         
         # #region agent log
-        debug_log("H2", f"stress_test:{2493}", "Processing user in task creation", {
-            "user_index": user_index,
-            "username": username,
+        debug_log("H2", f"stress_test:{2487}", "Starting task creation loop", {
+            "total_users": len(users),
             "sessions_per_user": sessions_per_user,
-            "tasks_created_so_far": len(tasks)
+            "expected_total_tasks": len(users) * sessions_per_user
         })
         # #endregion
         
-        # Create multiple browser windows (sessions) for this user
-        # Each window is a separate browser context, allowing concurrent chatting
-        for session_idx in range(sessions_per_user):
-            session_id_counter += 1
-            session_id = f"User{user_index+1}_Session{session_idx+1}_{user['username']}"
+        for user_index, user in enumerate(users):
+            user_questions = user.get('questions', [])
+            username = user.get('username', 'Unknown')
+            user_task_counts[user_index] = 0
             
             # #region agent log
-            debug_log("H1", f"stress_test:{2969}", "Task creation start - H1: Browser context limit", {
-                "session_id": session_id,
-                "user_index": user_index,
-                "session_idx": session_idx,
-                "task_number": len(tasks),
-                "total_tasks_so_far": len(tasks),
-                "username": username,
-                "user_tasks_created": user_task_counts[user_index],
-                "total_users": len(users),
-                "current_user_number": user_index + 1
-            }, session_id=session_id)
-            # #endregion
-            
-            # #region agent log
-            debug_log("H2", f"stress_test:{2969}", "Task creation start - H2: Semaphore starvation", {
-                "session_id": session_id,
-                "user_index": user_index,
-                "semaphore_limit": semaphore_limit,
-                "semaphore_available": context_semaphore._value if hasattr(context_semaphore, '_value') else 'unknown',
-                "total_tasks_created": len(tasks),
-                "username": username
-            }, session_id=session_id)
-            # #endregion
-            
-            logging.info(f"Creating session: {session_id} for user {username} "
-                        f"(Session {session_idx+1} of {sessions_per_user} for this user)")
-            
-            # Each session gets its own browser window and will ask all questions concurrently
-            # with other sessions from the same user and other users
-            # Each window will handle both Course 1 and Course 2 if handle_both_courses is True
-            task = run_session_with_context(
-                browser, 
-                user, 
-                session_id, 
-                questions=user_questions,  # Pass all questions
-                handle_both_courses=handle_both_courses,
-                semaphore=context_semaphore
-            )
-            tasks.append(task)
-            task_creation_order.append(session_id)
-            user_task_counts[user_index] += 1
-            
-            # #region agent log
-            debug_log("H3", f"stress_test:{2292}", "Task created and appended", {
-                "session_id": session_id,
-                "task_number": len(tasks) - 1,
-                "total_tasks": len(tasks),
-                "creation_order": task_creation_order.copy(),
+            debug_log("H2", f"stress_test:{2493}", "Processing user in task creation", {
                 "user_index": user_index,
                 "username": username,
-                "user_total_tasks": user_task_counts[user_index]
-            }, session_id=session_id)
+                "sessions_per_user": sessions_per_user,
+                "tasks_created_so_far": len(tasks)
+            })
             # #endregion
-    
-    # #region agent log
-    debug_log("H1", f"stress_test:{3015}", "Task creation completed - H1: Browser context limit", {
-        "total_tasks_created": len(tasks),
-        "user_task_counts": user_task_counts,
-        "expected_total": len(users) * sessions_per_user,
-        "max_concurrent_contexts": max_contexts,
-        "semaphore_limit": semaphore_limit,
-        "total_concurrent_sessions": total_concurrent_sessions
-    })
-    # #endregion
-    
-    if not tasks:
-        logging.info("No sessions to create, exiting...")
-        return
-    
-    # Run all sessions concurrently (each opens its own browser window and asks all questions)
-    logging.info(f"\nStarting {len(tasks)} concurrent sessions - all questions will be asked concurrently...")
-    
-    # #region agent log
-    debug_log("H3", f"stress_test:{2298}", "About to start asyncio.gather", {
-        "total_tasks": len(tasks),
-        "task_order": task_creation_order.copy(),
-        "semaphore_limit": semaphore_limit,
-        "semaphore_available": context_semaphore._value if hasattr(context_semaphore, '_value') else 'unknown'
-    })
-    # #endregion
-    
-    if continuous_mode:
-        if continuous_iterations:
-            logging.info(f"Continuous mode: Each session will loop through questions {continuous_iterations} times")
-        else:
-            logging.info(f"Continuous mode: Each session will loop through questions indefinitely")
-        logging.info(f"All conversations will be maintained concurrently across all {total_concurrent_sessions} windows")
-    if handle_both_courses:
-        logging.info(f"Each browser window will open BOTH Course 1 and Course 2 tabs")
-        logging.info(f"Questions will be distributed between courses and asked concurrently")
-    if not continuous_mode:
-        logging.info(f"Each session will ask all its questions sequentially within its own browser window")
-    
-    gather_start_time = time.time()
-    
-    # #region agent log
-    debug_log("H4", f"stress_test:{2559}", "asyncio.gather starting execution", {
-        "total_tasks": len(tasks),
-        "task_creation_order": task_creation_order.copy(),
-        "user_task_counts": user_task_counts,
-        "semaphore_limit": semaphore_limit,
-        "semaphore_available": context_semaphore._value if hasattr(context_semaphore, '_value') else 'unknown'
-    })
-    # #endregion
-    
-    # Create tasks immediately to ensure true parallelism - all users start simultaneously
-    # This ensures all users (including users 3-5) run in parallel without blocking
-    task_objects = [asyncio.create_task(task) for task in tasks]
-    results = await asyncio.gather(*task_objects, return_exceptions=True)
-    gather_end_time = time.time()
+            
+            # Create multiple browser windows (sessions) for this user
+            # Each window is a separate browser context, allowing concurrent chatting
+            for session_idx in range(sessions_per_user):
+                session_id_counter += 1
+                session_id = f"User{user_index+1}_Session{session_idx+1}_{user['username']}"
+                
+                # #region agent log
+                debug_log("H1", f"stress_test:{2969}", "Task creation start - H1: Browser context limit", {
+                    "session_id": session_id,
+                    "user_index": user_index,
+                    "session_idx": session_idx,
+                    "task_number": len(tasks),
+                    "total_tasks_so_far": len(tasks),
+                    "username": username,
+                    "user_tasks_created": user_task_counts[user_index],
+                    "total_users": len(users),
+                    "current_user_number": user_index + 1
+                }, session_id=session_id)
+                # #endregion
+                
+                # #region agent log
+                debug_log("H2", f"stress_test:{2969}", "Task creation start - H2: Semaphore starvation", {
+                    "session_id": session_id,
+                    "user_index": user_index,
+                    "semaphore_limit": semaphore_limit,
+                    "semaphore_available": context_semaphore._value if hasattr(context_semaphore, '_value') else 'unknown',
+                    "total_tasks_created": len(tasks),
+                    "username": username
+                }, session_id=session_id)
+                # #endregion
+                
+                logging.info(f"Creating session: {session_id} for user {username} "
+                            f"(Session {session_idx+1} of {sessions_per_user} for this user)")
+                
+                # Each session gets its own browser window and will ask all questions concurrently
+                # with other sessions from the same user and other users
+                # Each window will handle both Course 1 and Course 2 if handle_both_courses is True
+                task = run_session_with_context(
+                    browser, 
+                    user, 
+                    session_id, 
+                    questions=user_questions,  # Pass all questions
+                    handle_both_courses=handle_both_courses,
+                    semaphore=context_semaphore
+                )
+                tasks.append(task)
+                task_creation_order.append(session_id)
+                user_task_counts[user_index] += 1
+                
+                # #region agent log
+                debug_log("H3", f"stress_test:{2292}", "Task created and appended", {
+                    "session_id": session_id,
+                    "task_number": len(tasks) - 1,
+                    "total_tasks": len(tasks),
+                    "creation_order": task_creation_order.copy(),
+                    "user_index": user_index,
+                    "username": username,
+                    "user_total_tasks": user_task_counts[user_index]
+                }, session_id=session_id)
+                # #endregion
+        
+        # #region agent log
+        debug_log("H1", f"stress_test:{3015}", "Task creation completed - H1: Browser context limit", {
+            "total_tasks_created": len(tasks),
+            "user_task_counts": user_task_counts,
+            "expected_total": len(users) * sessions_per_user,
+            "max_concurrent_contexts": max_contexts,
+            "semaphore_limit": semaphore_limit,
+            "total_concurrent_sessions": total_concurrent_sessions
+        })
+        # #endregion
+        
+        if not tasks:
+            logging.info("No sessions to create, exiting...")
+            return
+        
+        # Run all sessions concurrently (each opens its own browser window and asks all questions)
+        logging.info(f"\nStarting {len(tasks)} concurrent sessions - all questions will be asked concurrently...")
+        
+        # #region agent log
+        debug_log("H3", f"stress_test:{2298}", "About to start asyncio.gather", {
+            "total_tasks": len(tasks),
+            "task_order": task_creation_order.copy(),
+            "semaphore_limit": semaphore_limit,
+            "semaphore_available": context_semaphore._value if hasattr(context_semaphore, '_value') else 'unknown'
+        })
+        # #endregion
+        
+        if continuous_mode:
+            if continuous_iterations:
+                logging.info(f"Continuous mode: Each session will loop through questions {continuous_iterations} times")
+            else:
+                logging.info(f"Continuous mode: Each session will loop through questions indefinitely")
+            logging.info(f"All conversations will be maintained concurrently across all {total_concurrent_sessions} windows")
+        if handle_both_courses:
+            logging.info(f"Each browser window will open BOTH Course 1 and Course 2 tabs")
+            logging.info(f"Questions will be distributed between courses and asked concurrently")
+        if not continuous_mode:
+            logging.info(f"Each session will ask all its questions sequentially within its own browser window")
+        
+            gather_start_time = time.time()
+        
+        # #region agent log
+        debug_log("H4", f"stress_test:{2559}", "asyncio.gather starting execution", {
+            "total_tasks": len(tasks),
+            "task_creation_order": task_creation_order.copy(),
+            "user_task_counts": user_task_counts,
+            "semaphore_limit": semaphore_limit,
+            "semaphore_available": context_semaphore._value if hasattr(context_semaphore, '_value') else 'unknown'
+        })
+        # #endregion
+        
+        # Create tasks immediately to ensure true parallelism - all users start simultaneously
+        # This ensures all users (including users 3-5) run in parallel without blocking
+        task_objects = [asyncio.create_task(task) for task in tasks]
+        results = await asyncio.gather(*task_objects, return_exceptions=True)
+        gather_end_time = time.time()
     
     # Analyze which users actually executed
     user_execution_status = {}
@@ -3623,7 +3772,7 @@ async def main():
     async with async_playwright() as p:
         # Create browser - NOT headless to ensure all windows are visible for monitoring
         browser = await p.chromium.launch(
-            headless=True,  # Always visible for monitoring and debugging
+            headless=False,  # Always visible for monitoring and debugging
             args=['--start-maximized']  # Start maximized for better visibility
         )
         

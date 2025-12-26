@@ -7,7 +7,7 @@ Configuration constants for the Playwright stress test application.
 # ============================================================================
 STRESS_TEST_CONFIG = {
     'enabled': True,  # Set to False for normal single session mode
-    'sessions_per_user': 10,  # Number of concurrent browser windows per user (each user logs in multiple times) - Can be calculated dynamically
+    'sessions_per_user': 1,  # Number of concurrent browser windows per user (each user logs in multiple times) - Can be calculated dynamically
     'delay_between_questions': 0,  # NO DELAY - Maximum performance mode (was 3 seconds)
     'handle_both_courses': True,  # Set to False to open only one course per session
     # 'course_for_questions': 1,  # Which course to open (1 or 2) - only used if handle_both_courses is False
@@ -32,7 +32,16 @@ STRESS_TEST_CONFIG = {
     # Session Tracking Configuration
     'enable_session_tracking': True,  # Enable concurrent session tracking with periodic reports
     'tracking_report_interval': 300,  # Seconds between periodic tracking reports (default: 5 minutes = 300s)
+    # Batch Processing Configuration
+    'batch_processing': {
+        'enabled': False,  # Enable batch processing (process users in batches instead of all at once)
+        'users_per_batch': 3,  # Number of users to process per batch (total users is fixed at 5)
+        'delay_between_batches': 10,  # Seconds to wait between batches (only if wait_for_completion is True)
+        'wait_for_completion': True,  # If True, wait for batch to complete before starting next. If False, batches run concurrently
+    },
+    # Note: Total users is fixed at 5 (defined in USERS list below)
     # Example: 5 users × 10 sessions = 50 concurrent browser windows, each handling one course
+    # Example with batch processing: Batch 1 (3 users × 5 sessions = 15), wait 10s, Batch 2 (2 users × 5 sessions = 10)
 }
 
 # ============================================================================
