@@ -12,7 +12,6 @@ from concurrent.futures import ThreadPoolExecutor
 import threading
 from browser.page_monitoring import setup_network_monitoring
 
-from utils.config_optimizer import update_stress_test_config
 from config import (
     STRESS_TEST_CONFIG,
     USERS,
@@ -22,6 +21,7 @@ from config import (
     course_2_questions,
     general_questions
 )
+from utils.config_optimizer import update_stress_test_config
 
 # Debug logging path is determined dynamically relative to the script's location, inside a '.cursor' folder
 DEBUG_LOG_PATH = str(Path(__file__).parent / ".cursor" / "debug.log")
@@ -116,7 +116,6 @@ THREAD_POOL = ThreadPoolExecutor(max_workers=20, thread_name_prefix="playwright_
 # Lock for thread-safe operations
 CSV_LOCK = threading.Lock()
 
-from utils.config_optimizer import update_stress_test_config
 # Configuration is imported from config.py to avoid duplication
 # All configuration (STRESS_TEST_CONFIG, USERS, QUESTION_CONFIG, etc.) is now centralized in config.py
 
@@ -3280,19 +3279,25 @@ def write_csv_report(append_mode=False):
 
 async def stress_test(browser, users):
     """Run stress test where all sessions ask questions concurrently across multiple browser windows."""
-    # Calculate optimal configuration based on resources
+    # Skip dynamic resource calculation if disabled (e.g., when sessions_per_user is set via API)
     if STRESS_TEST_CONFIG.get('dynamic_resource_calculation', True):
         # Force maximum contexts - override to use hard limit
         update_stress_test_config(
             dynamic_mode=True,
             override_max_contexts=10000  # Force maximum hard limit
         )
+        logging.info("[STRESS_TEST] Dynamic resource calculation enabled - values calculated based on system resources")
+    else:
+        logging.info("[STRESS_TEST] Dynamic resource calculation disabled - using values from config/API")
     
     all_session_metrics = []
     stress_test_start = time.time()
     
     # Get configuration (values are now optimized and stored in STRESS_TEST_CONFIG)
     sessions_per_user = STRESS_TEST_CONFIG.get('sessions_per_user', 1)
+    
+    # Log the final sessions_per_user value for debugging
+    logging.info(f"[STRESS_TEST] Final sessions_per_user: {sessions_per_user}")
     delay_between_questions = STRESS_TEST_CONFIG.get('delay_between_questions', 2)
     handle_both_courses = STRESS_TEST_CONFIG.get('handle_both_courses', True)
     
@@ -3396,6 +3401,17 @@ async def stress_test(browser, users):
         all_batch_results = []
         gather_start_time = time.time()  # Start timing for batch mode
         
+        # Log batch configuration for debugging
+        logging.info("=" * 80)
+        logging.info("BATCH PROCESSING CONFIGURATION:")
+        logging.info(f"  Total users: {len(users)}")
+        logging.info(f"  Sessions per user: {sessions_per_user}")
+        logging.info(f"  Users per batch: {users_per_batch}")
+        logging.info(f"  Total batches: {total_batches}")
+        logging.info(f"  Delay between batches: {delay_between_batches} seconds")
+        logging.info(f"  Wait for completion: {wait_for_completion}")
+        logging.info("=" * 80)
+        
         for batch_num in range(total_batches):
             start_idx = batch_num * users_per_batch
             end_idx = min(start_idx + users_per_batch, len(users))
@@ -3415,18 +3431,31 @@ async def stress_test(browser, users):
             batch_task_creation_order = []  # Local to this batch
             user_task_counts = {}
             
+            # Re-read sessions_per_user from config to ensure we have the latest value
+            current_sessions_per_user = STRESS_TEST_CONFIG.get('sessions_per_user', 1)
+            if current_sessions_per_user != sessions_per_user:
+                logging.warning(f"[BATCH {batch_num+1}] sessions_per_user changed: was {sessions_per_user}, now {current_sessions_per_user}, using {current_sessions_per_user}")
+                sessions_per_user = current_sessions_per_user
+            
+            # Ensure sessions_per_user is valid
+            if sessions_per_user <= 0:
+                logging.error(f"[BATCH {batch_num+1}] Invalid sessions_per_user: {sessions_per_user}, defaulting to 1")
+                sessions_per_user = 1
+            
             for batch_user_idx, user in enumerate(batch_users):
                 actual_user_index = start_idx + batch_user_idx
                 user_questions = user.get('questions', [])
                 username = user.get('username', 'Unknown')
                 user_task_counts[actual_user_index] = 0
                 
+                logging.info(f"[BATCH {batch_num+1}] User {actual_user_index+1} ({username}): Will create {sessions_per_user} session(s)")
+                
                 # Create multiple browser windows (sessions) for this user
                 for session_idx in range(sessions_per_user):
                     session_id_counter += 1
                     session_id = f"Batch{batch_num+1}_User{actual_user_index+1}_Session{session_idx+1}_{user['username']}"
                     
-                    logging.info(f"Creating session: {session_id} for user {username} "
+                    logging.info(f"[BATCH {batch_num+1}] Creating session: {session_id} for user {username} "
                                 f"(Session {session_idx+1} of {sessions_per_user} for this user)")
                     
                     task = run_session_with_context(
@@ -3442,6 +3471,16 @@ async def stress_test(browser, users):
                     task_creation_order.append(session_id)  # Also add to global list for tracking
                     tasks.append(task)  # Add to global tasks list for tracking
                     user_task_counts[actual_user_index] += 1
+                
+                # Verify correct number of sessions created for this user
+                expected_sessions = sessions_per_user
+                actual_sessions = user_task_counts[actual_user_index]
+                if actual_sessions != expected_sessions:
+                    logging.error(f"[BATCH {batch_num+1}] ERROR: User {actual_user_index+1} ({username}) created {actual_sessions} sessions but expected {expected_sessions}")
+                else:
+                    logging.info(f"[BATCH {batch_num+1}] ✓ User {actual_user_index+1} ({username}): Created {actual_sessions} session(s) as expected")
+                    
+                logging.info(f"[BATCH {batch_num+1}] User {actual_user_index+1} ({username}): Created {user_task_counts[actual_user_index]} session(s) (expected: {sessions_per_user})")
             
             if not batch_tasks:
                 logging.warning(f"Batch {batch_num + 1} has no tasks, skipping...")
@@ -3468,10 +3507,24 @@ async def stress_test(browser, users):
                     await asyncio.sleep(delay_between_batches)
             else:
                 # Start batch but don't wait - batches run concurrently
-                batch_task_objects = [asyncio.create_task(task) for task in batch_tasks]
+                # IMPORTANT: Create tasks from coroutines - ensure each coroutine becomes exactly one task
+                logging.info(f"[BATCH {batch_num+1}] Creating {len(batch_tasks)} task(s) from {len(batch_tasks)} coroutine(s)")
+                logging.info(f"[BATCH {batch_num+1}] Session IDs in this batch: {batch_task_creation_order}")
+                
+                batch_task_objects = []
+                for idx, task_coroutine in enumerate(batch_tasks):
+                    # Create task from coroutine - this schedules it to run
+                    task_obj = asyncio.create_task(task_coroutine)
+                    batch_task_objects.append(task_obj)
+                    if idx < len(batch_task_creation_order):
+                        logging.debug(f"[BATCH {batch_num+1}] Created task {idx+1}/{len(batch_tasks)} for: {batch_task_creation_order[idx]}")
+                
+                if len(batch_task_objects) != len(batch_tasks):
+                    logging.error(f"[BATCH {batch_num+1}] ERROR: Created {len(batch_task_objects)} tasks but expected {len(batch_tasks)}")
+                
                 all_batch_results.extend(batch_task_objects)
                 
-                logging.info(f"Batch {batch_num + 1} started (running concurrently with other batches)")
+                logging.info(f"[BATCH {batch_num+1}] Started {len(batch_task_objects)} task(s) (running concurrently with other batches)")
                 
                 # Wait before starting next batch (but don't wait for completion)
                 if batch_num < total_batches - 1:
